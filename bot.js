@@ -1,7 +1,7 @@
 const axios = require("axios");
 const TelegramBot = require("node-telegram-bot-api");
 
-const TELEGRAM_TOKEN = "8615074268:AAE9YjggWHly2JYHfOuV1sj8zA4tfNLBUZY";
+const TELEGRAM_TOKEN = "8615074268:AAH9qdDdC7nIhqkW1av46Os5TuAWEu1YQhc";
 const CHAT_ID = "1565534524";
 const WALLET = "0xBc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D";
 const HYPERVM_RPC = "https://rpc.hyperliquid.xyz/evm";
