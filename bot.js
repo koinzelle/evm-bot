@@ -47,14 +47,15 @@ async function getPoolTick(rpc, pool) {
 
 async function getPrjxActivePositions() {
     try {
-        const walletPadded = WALLET.toLowerCase().replace("0x", "").padStart(64, "0");
+        const walletAddr = (WALLET || "0xBc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D").toLowerCase().replace("0x", "");
+        const walletPadded = walletAddr.padStart(64, "0");
         const balanceHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x70a08231" + walletPadded);
         const balance = parseInt(balanceHex, 16);
         console.log("Wallet:", WALLET, "| NFT balance:", balance);
         const positions = [];
         for (let i = 0; i < balance; i++) {
             const indexHex = i.toString(16).padStart(64, "0");
-            const tokenIdHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x2f745c59" + walletPadded + indexHex);
+            const tokenIdHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x2f745c59" + walletPadded.padStart(64, "0") + indexHex);
             const tokenId = parseInt(tokenIdHex, 16);
             const tokenIdPadded = tokenId.toString(16).padStart(64, "0");
             const posData = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x99fbab88" + tokenIdPadded);
