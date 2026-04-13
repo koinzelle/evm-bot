@@ -51,30 +51,33 @@ async function getPrjxActivePositions() {
         const walletPadded = walletAddr.padStart(64, "0");
         const balanceHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x70a08231" + walletPadded);
         const balance = parseInt(balanceHex, 16);
-        console.log("Wallet:", WALLET, "| NFT balance:", balance);
         const positions = [];
-        for (let i = 0; i < balance; i++) {
+        let skipped = 0;
+        // Scan en partant des NFTs les plus récents (fin de liste), s'arrête après 15 vides consécutifs
+        let emptyStreak = 0;
+        for (let i = balance - 1; i >= 0 && emptyStreak < 15; i--) {
             const indexHex = i.toString(16).padStart(64, "0");
-            const tokenIdHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x2f745c59" + walletPadded.padStart(64, "0") + indexHex);
+            const tokenIdHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x2f745c59" + walletPadded + indexHex);
             const tokenId = parseInt(tokenIdHex, 16);
             const tokenIdPadded = tokenId.toString(16).padStart(64, "0");
             const posData = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x99fbab88" + tokenIdPadded);
-            if (!posData || posData === "0x") continue;
+            if (!posData || posData === "0x") { emptyStreak++; continue; }
             const data = posData.slice(2);
             const liquidity = BigInt("0x" + data.slice(448, 512));
-            if (liquidity === 0n) { console.log("  NFT #" + tokenId + " — liquidity 0, ignoré"); continue; }
+            if (liquidity === 0n) { emptyStreak++; skipped++; continue; }
+            emptyStreak = 0;
             const token0 = data.slice(128, 192).slice(24).toLowerCase();
             const token1 = data.slice(192, 256).slice(24).toLowerCase();
             const tickLower = decodeTick(data.slice(320, 384));
             const tickUpper = decodeTick(data.slice(384, 448));
-            console.log("  NFT #" + tokenId + " | token0: " + token0 + " | token1: " + token1 + " | range [" + tickLower + ", " + tickUpper + "]");
             const isUbtc = token0.includes(UBTC) || token1.includes(UBTC);
             const isUpump = token0.includes(UPUMP) || token1.includes(UPUMP);
-            if (!isUbtc && !isUpump) { console.log("  → ignoré (pas uBTC ni upump)"); continue; }
+            if (!isUbtc && !isUpump) continue;
             const poolName = isUbtc ? "PRJX HYPE/uBTC" : "PRJX upump/HYPE";
             const pool = isUbtc ? HYPE_UBTC_POOL : UPUMP_HYPE_POOL;
             positions.push({ tokenId, tickLower, tickUpper, poolName, pool });
         }
+        if (skipped > 0) console.log("  (" + skipped + " NFTs inactifs ignorés)");
         return positions;
     } catch (err) {
         console.log("Erreur positions PRJX:", err.message);
