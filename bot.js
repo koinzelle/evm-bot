@@ -47,26 +47,29 @@ async function getPoolTick(rpc, pool) {
 
 async function getPrjxActivePositions() {
     try {
-        const balanceHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x70a08231000000000000000000000000Bc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D");
+        const walletPadded = WALLET.toLowerCase().replace("0x", "").padStart(64, "0");
+        const balanceHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x70a08231" + walletPadded);
         const balance = parseInt(balanceHex, 16);
+        console.log("Wallet:", WALLET, "| NFT balance:", balance);
         const positions = [];
         for (let i = 0; i < balance; i++) {
             const indexHex = i.toString(16).padStart(64, "0");
-            const tokenIdHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x2f745c59000000000000000000000000Bc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D" + indexHex);
+            const tokenIdHex = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x2f745c59" + walletPadded + indexHex);
             const tokenId = parseInt(tokenIdHex, 16);
             const tokenIdPadded = tokenId.toString(16).padStart(64, "0");
             const posData = await rpcCall(HYPERVM_RPC, PRJX_NFPM, "0x99fbab88" + tokenIdPadded);
             if (!posData || posData === "0x") continue;
             const data = posData.slice(2);
             const liquidity = BigInt("0x" + data.slice(448, 512));
-            if (liquidity === 0n) continue;
+            if (liquidity === 0n) { console.log("  NFT #" + tokenId + " — liquidity 0, ignoré"); continue; }
             const token0 = data.slice(128, 192).slice(24).toLowerCase();
             const token1 = data.slice(192, 256).slice(24).toLowerCase();
             const tickLower = decodeTick(data.slice(320, 384));
             const tickUpper = decodeTick(data.slice(384, 448));
+            console.log("  NFT #" + tokenId + " | token0: " + token0 + " | token1: " + token1 + " | range [" + tickLower + ", " + tickUpper + "]");
             const isUbtc = token0.includes(UBTC) || token1.includes(UBTC);
             const isUpump = token0.includes(UPUMP) || token1.includes(UPUMP);
-            if (!isUbtc && !isUpump) continue;
+            if (!isUbtc && !isUpump) { console.log("  → ignoré (pas uBTC ni upump)"); continue; }
             const poolName = isUbtc ? "PRJX HYPE/uBTC" : "PRJX upump/HYPE";
             const pool = isUbtc ? HYPE_UBTC_POOL : UPUMP_HYPE_POOL;
             positions.push({ tokenId, tickLower, tickUpper, poolName, pool });
@@ -78,6 +81,15 @@ async function getPrjxActivePositions() {
     }
 }
 
+async function sendAlert(msg) {
+    try {
+        await bot.sendMessage(CHAT_ID, msg);
+        console.log("✅ Telegram envoyé");
+    } catch (err) {
+        console.log("❌ Telegram ERREUR:", err.message);
+    }
+}
+
 async function check() {
     console.log("\n--- Verification ---");
     const veloTick = await getPoolTick(SONEIUM_RPC, VELODROME_POOL);
@@ -86,10 +98,13 @@ async function check() {
         console.log("Velodrome WBTC/WETH | Tick: " + veloTick + " | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
         if (!inRange && !alertedPositions["velodrome"]) {
             const side = veloTick < VELODROME_TICK_LOWER ? "100% WBTC" : "100% WETH";
-            bot.sendMessage(CHAT_ID, "OUT OF RANGE!\n\nVelodrome WBTC/WETH\nTick: " + veloTick + "\nTu es: " + side + "\n\nAjuste ta position!");
+            await sendAlert("🚨 OUT OF RANGE!\n\nVelodrome WBTC/WETH\nTick: " + veloTick + "\nTu es: " + side + "\n\nAjuste ta position!");
             alertedPositions["velodrome"] = true;
         }
-        if (inRange) alertedPositions["velodrome"] = false;
+        if (inRange && alertedPositions["velodrome"]) {
+            await sendAlert("✅ Retour IN RANGE\n\nVelodrome WBTC/WETH\nTick: " + veloTick);
+            alertedPositions["velodrome"] = false;
+        }
     }
     const positions = await getPrjxActivePositions();
     console.log("PRJX: " + positions.length + " positions actives");
@@ -100,11 +115,14 @@ async function check() {
         console.log(pos.poolName + " #" + pos.tokenId + " | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
         const key = "prjx_" + pos.tokenId;
         if (!inRange && !alertedPositions[key]) {
-            const side = tick < pos.tickLower ? "100% token A" : "100% token B";
-            bot.sendMessage(CHAT_ID, "OUT OF RANGE!\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick + "\nTu es: " + side + "\n\nAjuste ta position!");
+            const side = tick < pos.tickLower ? "100% HYPE" : "100% uBTC/upump";
+            await sendAlert("🚨 OUT OF RANGE!\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick + "\nRange: [" + pos.tickLower + ", " + pos.tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!");
             alertedPositions[key] = true;
         }
-        if (inRange) alertedPositions[key] = false;
+        if (inRange && alertedPositions[key]) {
+            await sendAlert("✅ Retour IN RANGE\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick);
+            alertedPositions[key] = false;
+        }
     }
 }
 
