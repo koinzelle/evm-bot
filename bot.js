@@ -6,7 +6,10 @@ const CHAT_ID = process.env.CHAT_ID;
 const WALLET = process.env.WALLET;
 const HYPERVM_RPC = "https://rpc.hyperliquid.xyz/evm";
 const SONEIUM_RPC = "https://rpc.soneium.org";
+const CITREA_RPC = "https://rpc.mainnet.citrea.xyz";
 const PRJX_NFPM = "0xeaD19AE861c29bBb2101E834922B2FEee69B9091";
+const SATSUMA_NFPM = "0x9aa034631e14e2c7fc01890f8d7b19ab6aed1666";
+const SATSUMA_CBTC_CTUSD_POOL = "0x5d4b518984ae9778479ee2ea782b9925bbf17080";
 const VELODROME_POOL = "0xc6b8e3559feb231d7769c12872ffbe95c3e20ff7";
 const VELODROME_TICK_LOWER = 264247;
 const VELODROME_TICK_UPPER = 265547;
@@ -85,6 +88,39 @@ async function getPrjxActivePositions() {
     }
 }
 
+async function getSatsumaActivePositions() {
+    try {
+        const walletAddr = (WALLET || "0xBc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D").toLowerCase().replace("0x", "");
+        const walletPadded = walletAddr.padStart(64, "0");
+        const balanceHex = await rpcCall(CITREA_RPC, SATSUMA_NFPM, "0x70a08231" + walletPadded);
+        const balance = parseInt(balanceHex, 16);
+        if (!balance || balance === 0) return [];
+        const positions = [];
+        let skipped = 0;
+        let emptyStreak = 0;
+        for (let i = balance - 1; i >= 0 && emptyStreak < 15; i--) {
+            const indexHex = i.toString(16).padStart(64, "0");
+            const tokenIdHex = await rpcCall(CITREA_RPC, SATSUMA_NFPM, "0x2f745c59" + walletPadded + indexHex);
+            const tokenId = parseInt(tokenIdHex, 16);
+            const tokenIdPadded = tokenId.toString(16).padStart(64, "0");
+            const posData = await rpcCall(CITREA_RPC, SATSUMA_NFPM, "0x99fbab88" + tokenIdPadded);
+            if (!posData || posData === "0x") { emptyStreak++; continue; }
+            const data = posData.slice(2);
+            const liquidity = BigInt("0x" + data.slice(448, 512));
+            if (liquidity === 0n) { emptyStreak++; skipped++; continue; }
+            emptyStreak = 0;
+            const tickLower = decodeTick(data.slice(320, 384));
+            const tickUpper = decodeTick(data.slice(384, 448));
+            positions.push({ tokenId, tickLower, tickUpper, poolName: "Satsuma cBTC/ctUSD", pool: SATSUMA_CBTC_CTUSD_POOL });
+        }
+        if (skipped > 0) console.log("  (" + skipped + " NFTs Satsuma inactifs ignorés)");
+        return positions;
+    } catch (err) {
+        console.log("Erreur positions Satsuma:", err.message);
+        return [];
+    }
+}
+
 async function sendAlert(msg) {
     try {
         await bot.sendMessage(CHAT_ID, msg);
@@ -125,6 +161,26 @@ async function check() {
         }
         if (inRange && alertedPositions[key]) {
             await sendAlert("✅ Retour IN RANGE\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick);
+            alertedPositions[key] = false;
+        }
+    }
+
+    // ── Satsuma (Citrea) ──────────────────────────────────────
+    const satsumaPositions = await getSatsumaActivePositions();
+    console.log("Satsuma: " + satsumaPositions.length + " positions actives");
+    for (const pos of satsumaPositions) {
+        const tick = await getPoolTick(CITREA_RPC, pos.pool);
+        if (tick === null) continue;
+        const inRange = tick >= pos.tickLower && tick <= pos.tickUpper;
+        console.log(pos.poolName + " #" + pos.tokenId + " | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
+        const key = "satsuma_" + pos.tokenId;
+        if (!inRange && !alertedPositions[key]) {
+            const side = tick < pos.tickLower ? "100% cBTC" : "100% ctUSD";
+            await sendAlert("🚨 OUT OF RANGE!\n\nSatsuma cBTC/ctUSD #" + pos.tokenId + "\nTick: " + tick + "\nRange: [" + pos.tickLower + ", " + pos.tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!");
+            alertedPositions[key] = true;
+        }
+        if (inRange && alertedPositions[key]) {
+            await sendAlert("✅ Retour IN RANGE\n\nSatsuma cBTC/ctUSD #" + pos.tokenId + "\nTick: " + tick);
             alertedPositions[key] = false;
         }
     }
