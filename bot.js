@@ -8,7 +8,7 @@ const HYPERVM_RPC = "https://rpc.hyperliquid.xyz/evm";
 const SONEIUM_RPC = "https://rpc.soneium.org";
 const CITREA_RPC = "https://rpc.mainnet.citrea.xyz";
 const PRJX_NFPM = "0xeaD19AE861c29bBb2101E834922B2FEee69B9091";
-const SATSUMA_NFPM = "0x9aa034631e14e2c7fc01890f8d7b19ab6aed1666";
+const SATSUMA_NFPM = "0x69D57B9D705eaD73a5d2f2476C30c55bD755cc2F"; // Algebra Positions NFT-V2
 const SATSUMA_CBTC_CTUSD_POOL = "0x5d4b518984ae9778479ee2ea782b9925bbf17080";
 const VELODROME_POOL = "0xc6b8e3559feb231d7769c12872ffbe95c3e20ff7";
 const VELODROME_TICK_LOWER = 264247;
@@ -40,10 +40,20 @@ async function rpcCall(rpc, to, data) {
 
 async function getPoolTick(rpc, pool) {
     try {
-        const result = await rpcCall(rpc, pool, "0x3850c7bd");
+        const result = await rpcCall(rpc, pool, "0x3850c7bd"); // slot0() — Uniswap V3
         return decodeTick(result.slice(66, 130));
     } catch (err) {
         console.log("Erreur tick:", err.message);
+        return null;
+    }
+}
+
+async function getAlgebraPoolTick(rpc, pool) {
+    try {
+        const result = await rpcCall(rpc, pool, "0xe76c01e4"); // globalState() — Algebra
+        return decodeTick(result.slice(66, 130));
+    } catch (err) {
+        console.log("Erreur tick Algebra:", err.message);
         return null;
     }
 }
@@ -169,7 +179,7 @@ async function check() {
     const satsumaPositions = await getSatsumaActivePositions();
     console.log("Satsuma: " + satsumaPositions.length + " positions actives");
     for (const pos of satsumaPositions) {
-        const tick = await getPoolTick(CITREA_RPC, pos.pool);
+        const tick = await getAlgebraPoolTick(CITREA_RPC, pos.pool);
         if (tick === null) continue;
         const inRange = tick >= pos.tickLower && tick <= pos.tickUpper;
         console.log(pos.poolName + " #" + pos.tokenId + " | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
