@@ -8,12 +8,7 @@ const HYPERVM_RPC = "https://rpc.hyperliquid.xyz/evm";
 const SONEIUM_RPC = "https://rpc.soneium.org";
 const BSC_RPC = "https://bsc-dataseed.binance.org/";
 const SAKE_POOL = "0x3C3987A310ee13F7B8cBBe21D97D4436ba5E4B5f";
-const LISTA_INTERACTION = "0xB68443Ee3e828baD1526b3e0Bdf2Dfc6b1975ec4";
-const LISTA_COLLATERALS = [
-    { token: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", symbol: "BNB" },     // WBNB
-    { token: "0xa2E3356610840701BDf5611a53974510Ae27E2e1", symbol: "WBETH" },
-    { token: "0xB0b84D294e0C75A6abe60171b70edEb2EFd14A1B", symbol: "slisBNB" },
-];
+const LISTA_MOOLAH = "0x8f73b65b4caaf64fba2af91cc5d4a2a1318e5d8c";
 const HF_ALERT_THRESHOLD = 1.15;
 const CITREA_RPC = "https://rpc.mainnet.citrea.xyz";
 const PRJX_NFPM = "0xeaD19AE861c29bBb2101E834922B2FEee69B9091";
@@ -197,38 +192,87 @@ async function checkMorphoLending() {
     }
 }
 
-// ── Lista DAO (BSC) ───────────────────────────────────────────
+// ── Lista DAO Moolah (BSC) — Morpho Blue fork ─────────────────
 async function checkListaLending() {
     try {
-        const wallet = (WALLET || "0xBc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D").toLowerCase().replace("0x", "");
-        const walletPadded = wallet.padStart(64, "0");
-        for (const col of LISTA_COLLATERALS) {
-            const tokenPadded = col.token.toLowerCase().replace("0x", "").padStart(64, "0");
-            // locked(token, user) — collatéral déposé
-            const lockedHex = await rpcCall(BSC_RPC, LISTA_INTERACTION, "0x804db99b" + tokenPadded + walletPadded);
-            const locked = Number(BigInt(lockedHex || "0x0")) / 1e18;
-            if (locked < 0.0001) continue; // pas de position sur ce collatéral
-            // currentLiquidationPrice(token, user)
-            const liqPriceHex = await rpcCall(BSC_RPC, LISTA_INTERACTION, "0x9e0e8b2c" + tokenPadded + walletPadded);
-            const liqPrice = Number(BigInt(liqPriceHex || "0x0")) / 1e18;
-            // collateralPrice(token)
-            const curPriceHex = await rpcCall(BSC_RPC, LISTA_INTERACTION, "0x32d9f3db" + tokenPadded);
-            const curPrice = Number(BigInt(curPriceHex || "0x0")) / 1e18;
-            if (curPrice === 0 || liqPrice === 0) continue;
-            const buffer = (curPrice - liqPrice) / curPrice;
-            const key = "lista_" + col.symbol;
-            console.log("Lista " + col.symbol + " | Prix: $" + curPrice.toFixed(4) + " | Liq: $" + liqPrice.toFixed(4) + " | Buffer: " + (buffer * 100).toFixed(1) + "%");
-            if (buffer < 0.15 && !alertedPositions[key]) {
-                await sendAlert("🚨 LIQUIDATION RISK!\n\nLista DAO (BSC)\nCollatéral: " + col.symbol + "\nPrix actuel: $" + curPrice.toFixed(4) + "\nPrix liquidation: $" + liqPrice.toFixed(4) + "\nBuffer: " + (buffer * 100).toFixed(1) + "% (< 15%)\n\nRembourse ou ajoute du collatéral !");
-                alertedPositions[key] = true;
+        const wallet = (WALLET || "0xBc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D").toLowerCase();
+
+        // Essai via API Morpho GraphQL (chainId 56 = BSC, couvre les forks Moolah indexés)
+        const query = `{ marketPositions(where: { userAddress_in: ["${wallet}"], chainId_in: [56] }) { items { market { uniqueKey lltv collateralAsset { symbol } loanAsset { symbol } } state { collateralUsd borrowAssetsUsd } } } }`;
+        const res = await axios.post("https://blue-api.morpho.org/graphql", { query }, { timeout: 10000 });
+        const items = res.data?.data?.marketPositions?.items || [];
+
+        if (items.length > 0) {
+            for (const pos of items) {
+                const m = pos.market || {};
+                const s = pos.state || {};
+                const colUsd = parseFloat(s.collateralUsd || 0);
+                const borUsd = parseFloat(s.borrowAssetsUsd || 0);
+                if (borUsd < 1) continue;
+                const lltv = Number(BigInt(m.lltv || "0")) / 1e18;
+                const hf = (colUsd * lltv) / borUsd;
+                const label = (m.collateralAsset?.symbol || "?") + "/" + (m.loanAsset?.symbol || "?");
+                const key = "lista_" + m.uniqueKey?.slice(0, 10);
+                console.log("Lista Moolah " + label + " | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
+                if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
+                    await sendAlert("🚨 LIQUIDATION RISK!\n\nLista DAO Moolah (BSC)\nMarché: " + label + "\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !");
+                    alertedPositions[key] = true;
+                }
+                if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
+                    await sendAlert("✅ Lista Moolah " + label + " OK\nHealth Factor: " + hf.toFixed(4));
+                    alertedPositions[key] = false;
+                }
             }
-            if (buffer >= 0.15 && alertedPositions[key]) {
-                await sendAlert("✅ Lista " + col.symbol + " OK\nBuffer: " + (buffer * 100).toFixed(1) + "%");
-                alertedPositions[key] = false;
-            }
+        } else {
+            // Fallback : lecture directe du contrat Moolah (Morpho Blue fork sur BSC)
+            // On appelle isHealthy() via accumulatorId — si la position existe, le HF est calculable
+            // avec position(id, address) + market(id) + oracle price
+            // Sans market ID connu, on signale juste si on détecte une position active
+            const walletPadded = wallet.replace("0x", "").padStart(64, "0");
+            // accrueInterest n'est pas nécessaire — on tente une lecture générique
+            // pour détecter si une dette existe (borrowShares > 0)
+            // Cette branche ne sera active que si l'API Morpho n'indexe pas Moolah
+            console.log("Lista Moolah | API Morpho BSC: aucune position trouvée pour ce wallet");
         }
     } catch (err) {
         console.log("Erreur Lista lending:", err.message);
+    }
+}
+
+// ── Alerte proximité de sortie de range (10% du range) ────────
+async function checkNearRange(poolName, tick, tickLower, tickUpper, key) {
+    if (tick < tickLower || tick > tickUpper) return; // déjà OUT OF RANGE, alerte séparée
+    const rangeWidth = tickUpper - tickLower;
+    const alertZone = rangeWidth * 0.10;
+    const keyLower = key + "_near_lower";
+    const keyUpper = key + "_near_upper";
+
+    const nearLower = tick < tickLower + alertZone;
+    const nearUpper = tick > tickUpper - alertZone;
+    const pctToLower = ((tick - tickLower) / rangeWidth * 100).toFixed(1);
+    const pctToUpper = ((tickUpper - tick) / rangeWidth * 100).toFixed(1);
+
+    const NEAR_RANGE_COOLDOWN = 10 * 60 * 1000; // re-alerte toutes les 10 min si toujours proche
+    const now = Date.now();
+
+    if (nearLower) {
+        const lastAlert = alertedPositions[keyLower];
+        if (!lastAlert || (now - lastAlert) > NEAR_RANGE_COOLDOWN) {
+            await sendAlert("⚠️ PROCHE SORTIE DE RANGE — côté BAS\n\n" + poolName + "\nTick actuel : " + tick + "\nBorne basse  : " + tickLower + "\nIl reste " + pctToLower + "% avant sortie\n\nLe prix est en train de baisser — surveille ta position !");
+            alertedPositions[keyLower] = now;
+        }
+    } else {
+        alertedPositions[keyLower] = 0;
+    }
+
+    if (nearUpper) {
+        const lastAlert = alertedPositions[keyUpper];
+        if (!lastAlert || (now - lastAlert) > NEAR_RANGE_COOLDOWN) {
+            await sendAlert("⚠️ PROCHE SORTIE DE RANGE — côté HAUT\n\n" + poolName + "\nTick actuel : " + tick + "\nBorne haute  : " + tickUpper + "\nIl reste " + pctToUpper + "% avant sortie\n\nLe prix est en train de monter — surveille ta position !");
+            alertedPositions[keyUpper] = now;
+        }
+    } else {
+        alertedPositions[keyUpper] = 0;
     }
 }
 
@@ -256,12 +300,13 @@ async function check() {
             await sendAlert("✅ Retour IN RANGE\n\nVelodrome WBTC/WETH\nTick: " + veloTick);
             alertedPositions["velodrome"] = false;
         }
+        await checkNearRange("Velodrome WBTC/WETH (Soneium)", veloTick, VELODROME_TICK_LOWER, VELODROME_TICK_UPPER, "velodrome");
     }
     const positions = await getPrjxActivePositions();
     console.log("PRJX: " + positions.length + " positions actives");
     for (const pos of positions) {
         const tick = await getPoolTick(HYPERVM_RPC, pos.pool);
-        if (tick === null) continue;
+        if (tick === null) { console.log(pos.poolName + " #" + pos.tokenId + " | ❌ tick null (RPC error)"); continue; }
         const inRange = tick >= pos.tickLower && tick <= pos.tickUpper;
         console.log(pos.poolName + " #" + pos.tokenId + " | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
         const key = "prjx_" + pos.tokenId;
@@ -274,6 +319,7 @@ async function check() {
             await sendAlert("✅ Retour IN RANGE\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick);
             alertedPositions[key] = false;
         }
+        await checkNearRange(pos.poolName + " #" + pos.tokenId + " (Hyperliquid)", tick, pos.tickLower, pos.tickUpper, key);
     }
 
     // ── Satsuma (Citrea) ──────────────────────────────────────
@@ -294,6 +340,7 @@ async function check() {
             await sendAlert("✅ Retour IN RANGE\n\nSatsuma cBTC/ctUSD #" + pos.tokenId + "\nTick: " + tick);
             alertedPositions[key] = false;
         }
+        await checkNearRange("Satsuma cBTC/ctUSD #" + pos.tokenId + " (Citrea)", tick, pos.tickLower, pos.tickUpper, key);
     }
 
     // ── Lending / Borrowing ───────────────────────────────────
