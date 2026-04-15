@@ -349,5 +349,11 @@ async function check() {
     await checkListaLending();
 }
 
-setInterval(check, 30000);
-check();
+let isChecking = false;
+async function safeCheck() {
+    if (isChecking) { console.log("⏳ Vérification précédente en cours, skip"); return; }
+    isChecking = true;
+    try { await check(); } finally { isChecking = false; }
+}
+setInterval(safeCheck, 30000);
+safeCheck();
