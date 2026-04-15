@@ -192,47 +192,56 @@ async function checkMorphoLending() {
     }
 }
 
-// ── Lista DAO Moolah (BSC) — Morpho Blue fork ─────────────────
+// ── Lista DAO Moolah (BSC) — lecture directe contrat ──────────
+// Market slisBNB/USD1 — ID vérifié on-chain
+const LISTA_MARKET_ID = "95f93825819b67a64610e6adb9ac5f70d5108f5121b9df6551e23a4a7a801b5b";
+const LISTA_ORACLE    = "0xF07b74724cC734079D9D1aa22fF7591B5A32D9d2";
+const LISTA_LLTV      = 860000000000000000n; // 86% en WAD (1e18)
+
 async function checkListaLending() {
     try {
-        const wallet = (WALLET || "0xBc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D").toLowerCase();
+        const wallet = (WALLET || "0xBc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D").toLowerCase().replace("0x", "");
 
-        // Essai via API Morpho GraphQL (chainId 56 = BSC, couvre les forks Moolah indexés)
-        const query = `{ marketPositions(where: { userAddress_in: ["${wallet}"], chainId_in: [56] }) { items { market { uniqueKey lltv collateralAsset { symbol } loanAsset { symbol } } state { collateralUsd borrowAssetsUsd } } } }`;
-        const res = await axios.post("https://blue-api.morpho.org/graphql", { query }, { timeout: 10000 });
-        const items = res.data?.data?.marketPositions?.items || [];
+        // position(bytes32 id, address user) → (supplyShares, borrowShares, collateral)
+        const posHex = await rpcCall(BSC_RPC, LISTA_MOOLAH,
+            "0x93c52062" + LISTA_MARKET_ID + "000000000000000000000000" + wallet);
+        if (!posHex || posHex === "0x") { console.log("Lista Moolah | Pas de données"); return; }
+        const pd = posHex.slice(2);
+        const borrowShares = BigInt("0x" + pd.slice(64, 128));
+        const collateral   = BigInt("0x" + pd.slice(128, 192));
+        if (borrowShares === 0n) { console.log("Lista Moolah slisBNB/USD1 | Aucune dette"); return; }
 
-        if (items.length > 0) {
-            for (const pos of items) {
-                const m = pos.market || {};
-                const s = pos.state || {};
-                const colUsd = parseFloat(s.collateralUsd || 0);
-                const borUsd = parseFloat(s.borrowAssetsUsd || 0);
-                if (borUsd < 1) continue;
-                const lltv = Number(BigInt(m.lltv || "0")) / 1e18;
-                const hf = (colUsd * lltv) / borUsd;
-                const label = (m.collateralAsset?.symbol || "?") + "/" + (m.loanAsset?.symbol || "?");
-                const key = "lista_" + m.uniqueKey?.slice(0, 10);
-                console.log("Lista Moolah " + label + " | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
-                if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-                    await sendAlert("🚨 LIQUIDATION RISK!\n\nLista DAO Moolah (BSC)\nMarché: " + label + "\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !");
-                    alertedPositions[key] = true;
-                }
-                if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
-                    await sendAlert("✅ Lista Moolah " + label + " OK\nHealth Factor: " + hf.toFixed(4));
-                    alertedPositions[key] = false;
-                }
-            }
-        } else {
-            // Fallback : lecture directe du contrat Moolah (Morpho Blue fork sur BSC)
-            // On appelle isHealthy() via accumulatorId — si la position existe, le HF est calculable
-            // avec position(id, address) + market(id) + oracle price
-            // Sans market ID connu, on signale juste si on détecte une position active
-            const walletPadded = wallet.replace("0x", "").padStart(64, "0");
-            // accrueInterest n'est pas nécessaire — on tente une lecture générique
-            // pour détecter si une dette existe (borrowShares > 0)
-            // Cette branche ne sera active que si l'API Morpho n'indexe pas Moolah
-            console.log("Lista Moolah | API Morpho BSC: aucune position trouvée pour ce wallet");
+        // market(bytes32 id) → (totalSupplyAssets, totalSupplyShares, totalBorrowAssets, totalBorrowShares, ...)
+        const mktHex = await rpcCall(BSC_RPC, LISTA_MOOLAH, "0x5c60e39a" + LISTA_MARKET_ID);
+        const md = mktHex.slice(2);
+        const totalBorrowAssets = BigInt("0x" + md.slice(128, 192));
+        const totalBorrowShares = BigInt("0x" + md.slice(192, 256));
+
+        // oracle price() → uint256 (prix slisBNB en USD1, scalé 1e36)
+        const priceHex = await rpcCall(BSC_RPC, LISTA_ORACLE, "0x5e9a523c");
+        const price = BigInt("0x" + priceHex.slice(2));
+
+        // borrowAssets = borrowShares * totalBorrowAssets / totalBorrowShares
+        const borrowAssets = totalBorrowShares > 0n
+            ? (borrowShares * totalBorrowAssets) / totalBorrowShares : 0n;
+        if (borrowAssets === 0n) { console.log("Lista Moolah | borrowAssets = 0"); return; }
+
+        // HF = (collateral * price * lltv) / (borrowAssets * 1e36 * 1e18)
+        const hfNum = collateral * price * LISTA_LLTV;
+        const hfDen = borrowAssets * (10n ** 36n) * (10n ** 18n);
+        const hf = Number(hfNum * 10000n / hfDen) / 10000;
+        const borUsd = Number(borrowAssets) / 1e18;
+
+        console.log("Lista Moolah slisBNB/USD1 | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
+
+        const key = "lista_slisBNB_USD1";
+        if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
+            await sendAlert("🚨 LIQUIDATION RISK!\n\nLista DAO Moolah (BSC)\nMarché: slisBNB/USD1\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !");
+            alertedPositions[key] = true;
+        }
+        if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
+            await sendAlert("✅ Lista Moolah slisBNB/USD1 OK\nHealth Factor: " + hf.toFixed(4));
+            alertedPositions[key] = false;
         }
     } catch (err) {
         console.log("Erreur Lista lending:", err.message);
