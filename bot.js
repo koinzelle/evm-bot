@@ -132,22 +132,25 @@ async function getSatsumaActivePositions() {
             const posData = await rpcCall(CITREA_RPC, SATSUMA_NFPM, "0x99fbab88" + tokenIdPadded);
             if (!posData || posData === "0x") { emptyStreak++; continue; }
             const data = posData.slice(2);
-            // Algebra V2 NFPM: nonce | operator | token0 | token1 | tickLower | tickUpper | liquidity | ...
-            // (pas de champ fee contrairement à Uniswap V3 → offsets décalés d'un mot de 32 bytes)
-            const liquidityAlgebra = BigInt("0x" + data.slice(384, 448));  // word 6
-            const liquidityUniV3  = BigInt("0x" + data.slice(448, 512));   // word 7
-            // On prend le premier non-nul (détecte automatiquement le format)
-            const liquidity = liquidityAlgebra > 0n ? liquidityAlgebra : liquidityUniV3;
+            // Détection automatique du format NFPM :
+            // Algebra V2 : nonce | operator | token0 | token1 | tickLower(w4) | tickUpper(w5) | liquidity(w6)
+            // Uniswap V3 : nonce | operator | token0 | token1 | fee(w4) | tickLower(w5) | tickUpper(w6) | liquidity(w7)
+            const tickLowerAlgebra = decodeTick(data.slice(256, 320)); // word 4
+            const tickUpperAlgebra = decodeTick(data.slice(320, 384)); // word 5
+            let tickLower, tickUpper, liquidity;
+            if (tickLowerAlgebra < tickUpperAlgebra) {
+                // Format Algebra confirmé
+                tickLower = tickLowerAlgebra;
+                tickUpper = tickUpperAlgebra;
+                liquidity = BigInt("0x" + data.slice(384, 448)); // word 6
+            } else {
+                // Format Uniswap V3 (fee field au word 4 décale tout)
+                tickLower = decodeTick(data.slice(320, 384)); // word 5
+                tickUpper = decodeTick(data.slice(384, 448)); // word 6
+                liquidity = BigInt("0x" + data.slice(448, 512)); // word 7
+            }
             if (liquidity === 0n) { emptyStreak++; skipped++; continue; }
             emptyStreak = 0;
-            // Tente Algebra offsets d'abord, fallback Uniswap V3 si ticks incohérents
-            let tickLower = decodeTick(data.slice(256, 320));  // Algebra: word 4
-            let tickUpper = decodeTick(data.slice(320, 384));  // Algebra: word 5
-            if (tickLower >= tickUpper) {
-                // Probablement format Uniswap V3 (avec champ fee en word 4)
-                tickLower = decodeTick(data.slice(320, 384));  // word 5
-                tickUpper = decodeTick(data.slice(384, 448));  // word 6
-            }
             console.log("  Satsuma NFT #" + tokenId + " | tickLower=" + tickLower + " | tickUpper=" + tickUpper + " | liquidity=" + liquidity.toString());
             positions.push({ tokenId, tickLower, tickUpper, poolName: "Satsuma cBTC/ctUSD", pool: SATSUMA_CBTC_CTUSD_POOL });
         }
