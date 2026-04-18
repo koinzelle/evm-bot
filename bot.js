@@ -53,13 +53,24 @@ async function getPoolTick(rpc, pool) {
 }
 
 async function getAlgebraPoolTick(rpc, pool) {
+    // Essaie globalState() Algebra (0xe76c01e4), puis slot0() Uniswap V3 (0x3850c7bd) en fallback
     try {
-        const result = await rpcCall(rpc, pool, "0xe76c01e4"); // globalState() — Algebra
-        return decodeTick(result.slice(66, 130));
+        const result = await rpcCall(rpc, pool, "0xe76c01e4");
+        if (result && result !== "0x" && result.length >= 130) {
+            return decodeTick(result.slice(66, 130));
+        }
     } catch (err) {
-        console.log("Erreur tick Algebra:", err.message);
-        return null;
+        console.log("Algebra globalState() échoué:", err.message, "— essai slot0()");
     }
+    try {
+        const result = await rpcCall(rpc, pool, "0x3850c7bd"); // slot0() — Uniswap V3
+        if (result && result !== "0x" && result.length >= 130) {
+            return decodeTick(result.slice(66, 130));
+        }
+    } catch (err) {
+        console.log("slot0() échoué aussi:", err.message);
+    }
+    return null;
 }
 
 async function getPrjxActivePositions() {
@@ -108,6 +119,7 @@ async function getSatsumaActivePositions() {
         const walletPadded = walletAddr.padStart(64, "0");
         const balanceHex = await rpcCall(CITREA_RPC, SATSUMA_NFPM, "0x70a08231" + walletPadded);
         const balance = parseInt(balanceHex, 16);
+        console.log("Satsuma NFPM balance: " + (isNaN(balance) ? "ERR" : balance));
         if (!balance || balance === 0) return [];
         const positions = [];
         let skipped = 0;
@@ -120,11 +132,23 @@ async function getSatsumaActivePositions() {
             const posData = await rpcCall(CITREA_RPC, SATSUMA_NFPM, "0x99fbab88" + tokenIdPadded);
             if (!posData || posData === "0x") { emptyStreak++; continue; }
             const data = posData.slice(2);
-            const liquidity = BigInt("0x" + data.slice(448, 512));
+            // Algebra V2 NFPM: nonce | operator | token0 | token1 | tickLower | tickUpper | liquidity | ...
+            // (pas de champ fee contrairement à Uniswap V3 → offsets décalés d'un mot de 32 bytes)
+            const liquidityAlgebra = BigInt("0x" + data.slice(384, 448));  // word 6
+            const liquidityUniV3  = BigInt("0x" + data.slice(448, 512));   // word 7
+            // On prend le premier non-nul (détecte automatiquement le format)
+            const liquidity = liquidityAlgebra > 0n ? liquidityAlgebra : liquidityUniV3;
             if (liquidity === 0n) { emptyStreak++; skipped++; continue; }
             emptyStreak = 0;
-            const tickLower = decodeTick(data.slice(320, 384));
-            const tickUpper = decodeTick(data.slice(384, 448));
+            // Tente Algebra offsets d'abord, fallback Uniswap V3 si ticks incohérents
+            let tickLower = decodeTick(data.slice(256, 320));  // Algebra: word 4
+            let tickUpper = decodeTick(data.slice(320, 384));  // Algebra: word 5
+            if (tickLower >= tickUpper) {
+                // Probablement format Uniswap V3 (avec champ fee en word 4)
+                tickLower = decodeTick(data.slice(320, 384));  // word 5
+                tickUpper = decodeTick(data.slice(384, 448));  // word 6
+            }
+            console.log("  Satsuma NFT #" + tokenId + " | tickLower=" + tickLower + " | tickUpper=" + tickUpper + " | liquidity=" + liquidity.toString());
             positions.push({ tokenId, tickLower, tickUpper, poolName: "Satsuma cBTC/ctUSD", pool: SATSUMA_CBTC_CTUSD_POOL });
         }
         if (skipped > 0) console.log("  (" + skipped + " NFTs Satsuma inactifs ignorés)");
@@ -336,9 +360,12 @@ async function check() {
     console.log("Satsuma: " + satsumaPositions.length + " positions actives");
     for (const pos of satsumaPositions) {
         const tick = await getAlgebraPoolTick(CITREA_RPC, pos.pool);
-        if (tick === null) continue;
+        if (tick === null) {
+            console.log("⚠️ " + pos.poolName + " #" + pos.tokenId + " | Impossible de lire le tick (RPC Citrea KO) — vérification impossible !");
+            continue;
+        }
         const inRange = tick >= pos.tickLower && tick <= pos.tickUpper;
-        console.log(pos.poolName + " #" + pos.tokenId + " | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
+        console.log(pos.poolName + " #" + pos.tokenId + " | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (inRange ? "IN RANGE" : "⚠️ OUT OF RANGE"));
         const key = "satsuma_" + pos.tokenId;
         if (!inRange && !alertedPositions[key]) {
             const side = tick < pos.tickLower ? "100% cBTC" : "100% ctUSD";
