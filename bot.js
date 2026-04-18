@@ -175,8 +175,8 @@ async function checkSakeLending() {
         console.log("Sake (Soneium) | HF: " + hf.toFixed(4) + " | Debt: $" + totalDebt.toFixed(2));
         if (totalDebt < 1) return; // pas de position active
         if (hf < HF_ALERT_THRESHOLD && !alertedPositions["sake_hf"]) {
-            await sendAlert("🚨 LIQUIDATION RISK!\n\nSake Finance (Soneium)\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !");
-            alertedPositions["sake_hf"] = true;
+            if (await sendAlert("🚨 LIQUIDATION RISK!\n\nSake Finance (Soneium)\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !"))
+                alertedPositions["sake_hf"] = true;
         }
         if (hf >= HF_ALERT_THRESHOLD && alertedPositions["sake_hf"]) {
             await sendAlert("✅ Sake Finance OK\nHealth Factor: " + hf.toFixed(4));
@@ -206,8 +206,8 @@ async function checkMorphoLending() {
             const key = "morpho_" + m.uniqueKey?.slice(0, 10);
             console.log("Morpho " + label + " | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
             if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-                await sendAlert("🚨 LIQUIDATION RISK!\n\nMorpho Blue (Katana)\nMarché: " + label + "\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !");
-                alertedPositions[key] = true;
+                if (await sendAlert("🚨 LIQUIDATION RISK!\n\nMorpho Blue (Katana)\nMarché: " + label + "\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !"))
+                    alertedPositions[key] = true;
             }
             if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
                 await sendAlert("✅ Morpho " + label + " OK\nHealth Factor: " + hf.toFixed(4));
@@ -263,8 +263,8 @@ async function checkListaLending() {
 
         const key = "lista_slisBNB_USD1";
         if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-            await sendAlert("🚨 LIQUIDATION RISK!\n\nLista DAO Moolah (BSC)\nMarché: slisBNB/USD1\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !");
-            alertedPositions[key] = true;
+            if (await sendAlert("🚨 LIQUIDATION RISK!\n\nLista DAO Moolah (BSC)\nMarché: slisBNB/USD1\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !"))
+                alertedPositions[key] = true;
         }
         if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
             await sendAlert("✅ Lista Moolah slisBNB/USD1 OK\nHealth Factor: " + hf.toFixed(4));
@@ -313,12 +313,17 @@ async function checkNearRange(poolName, tick, tickLower, tickUpper, key) {
 }
 
 async function sendAlert(msg) {
-    try {
-        await bot.sendMessage(CHAT_ID, msg);
-        console.log("✅ Telegram envoyé");
-    } catch (err) {
-        console.log("❌ Telegram ERREUR:", err.message);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            await bot.sendMessage(CHAT_ID, msg);
+            console.log("✅ Telegram envoyé");
+            return true;
+        } catch (err) {
+            console.log("❌ Telegram ERREUR (tentative " + attempt + "/3):", err.message);
+            if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
+        }
     }
+    return false;
 }
 
 async function check() {
@@ -329,8 +334,8 @@ async function check() {
         console.log("Velodrome WBTC/WETH | Tick: " + veloTick + " | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
         if (!inRange && !alertedPositions["velodrome"]) {
             const side = veloTick < VELODROME_TICK_LOWER ? "100% WBTC" : "100% WETH";
-            await sendAlert("🚨 OUT OF RANGE!\n\nVelodrome WBTC/WETH\nTick: " + veloTick + "\nTu es: " + side + "\n\nAjuste ta position!");
-            alertedPositions["velodrome"] = true;
+            if (await sendAlert("🚨 OUT OF RANGE!\n\nVelodrome WBTC/WETH\nTick: " + veloTick + "\nTu es: " + side + "\n\nAjuste ta position!"))
+                alertedPositions["velodrome"] = true;
         }
         if (inRange && alertedPositions["velodrome"]) {
             await sendAlert("✅ Retour IN RANGE\n\nVelodrome WBTC/WETH\nTick: " + veloTick);
@@ -348,8 +353,8 @@ async function check() {
         const key = "prjx_" + pos.tokenId;
         if (!inRange && !alertedPositions[key]) {
             const side = tick < pos.tickLower ? "100% HYPE" : "100% uBTC/upump";
-            await sendAlert("🚨 OUT OF RANGE!\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick + "\nRange: [" + pos.tickLower + ", " + pos.tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!");
-            alertedPositions[key] = true;
+            if (await sendAlert("🚨 OUT OF RANGE!\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick + "\nRange: [" + pos.tickLower + ", " + pos.tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!"))
+                alertedPositions[key] = true;
         }
         if (inRange && alertedPositions[key]) {
             await sendAlert("✅ Retour IN RANGE\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick);
@@ -372,8 +377,8 @@ async function check() {
         const key = "satsuma_" + pos.tokenId;
         if (!inRange && !alertedPositions[key]) {
             const side = tick < pos.tickLower ? "100% cBTC" : "100% ctUSD";
-            await sendAlert("🚨 OUT OF RANGE!\n\nSatsuma cBTC/ctUSD #" + pos.tokenId + "\nTick: " + tick + "\nRange: [" + pos.tickLower + ", " + pos.tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!");
-            alertedPositions[key] = true;
+            if (await sendAlert("🚨 OUT OF RANGE!\n\nSatsuma cBTC/ctUSD #" + pos.tokenId + "\nTick: " + tick + "\nRange: [" + pos.tickLower + ", " + pos.tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!"))
+                alertedPositions[key] = true;
         }
         if (inRange && alertedPositions[key]) {
             await sendAlert("✅ Retour IN RANGE\n\nSatsuma cBTC/ctUSD #" + pos.tokenId + "\nTick: " + tick);
