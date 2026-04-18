@@ -1,8 +1,7 @@
 const axios = require("axios");
-const TelegramBot = require("node-telegram-bot-api");
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
+const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim().replace(/^[^0-9]+/, '');
+const CHAT_ID        = (process.env.CHAT_ID || '').trim();
 const WALLET = (process.env.WALLET || "0xBc16f4Eb00559Bb28949Ac89Ff61574dA87bAE2D").toLowerCase();
 const WALLET_NO_PREFIX = WALLET.replace("0x", "").padStart(64, "0");
 
@@ -33,7 +32,7 @@ const OOR_COOLDOWN        = 10 * 60 * 1000; // rappel hors range toutes les 10 m
 const CHECK_INTERVAL      = 60 * 1000;      // cycle toutes les 60s
 
 let alertedPositions = {};
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
+// Telegram via axios direct (même approche que le bot Meteora)
 
 // ── Utilitaires ───────────────────────────────────────────────
 
@@ -79,11 +78,15 @@ async function getAlgebraPoolTick(rpc, pool) {
 async function sendAlert(msg) {
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            await bot.sendMessage(CHAT_ID, msg);
+            await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+                chat_id: CHAT_ID,
+                text: msg,
+            }, { timeout: 10000 });
             console.log("✅ Telegram envoyé");
             return true;
         } catch (err) {
-            console.log("❌ Telegram ERREUR (tentative " + attempt + "/3):", err.message);
+            const detail = err.response?.data?.description || err.message;
+            console.log("❌ Telegram ERREUR (tentative " + attempt + "/3):", detail);
             if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
         }
     }
@@ -279,14 +282,14 @@ async function checkNearRange(poolName, tick, tickLower, tickUpper, key) {
     const keyUpper   = key + "_near_upper";
     if (tick < tickLower + alertZone) {
         if (!alertedPositions[keyLower] || now - alertedPositions[keyLower] > COOLDOWN) {
-            await sendAlert("⚠️ PROCHE SORTIE DE RANGE — côté BAS\n\n" + poolName + "\nTick actuel : " + tick + "\nBorne basse  : " + tickLower + "\nIl reste " + pctToLower + "% avant sortie\n\nLe prix est en train de baisser — surveille ta position !");
-            alertedPositions[keyLower] = now;
+            const ok = await sendAlert("⚠️ PROCHE SORTIE DE RANGE — côté BAS\n\n" + poolName + "\nTick actuel : " + tick + "\nBorne basse  : " + tickLower + "\nIl reste " + pctToLower + "% avant sortie\n\nLe prix est en train de baisser — surveille ta position !");
+            if (ok) alertedPositions[keyLower] = now;
         }
     } else { alertedPositions[keyLower] = 0; }
     if (tick > tickUpper - alertZone) {
         if (!alertedPositions[keyUpper] || now - alertedPositions[keyUpper] > COOLDOWN) {
-            await sendAlert("⚠️ PROCHE SORTIE DE RANGE — côté HAUT\n\n" + poolName + "\nTick actuel : " + tick + "\nBorne haute  : " + tickUpper + "\nIl reste " + pctToUpper + "% avant sortie\n\nLe prix est en train de monter — surveille ta position !");
-            alertedPositions[keyUpper] = now;
+            const ok = await sendAlert("⚠️ PROCHE SORTIE DE RANGE — côté HAUT\n\n" + poolName + "\nTick actuel : " + tick + "\nBorne haute  : " + tickUpper + "\nIl reste " + pctToUpper + "% avant sortie\n\nLe prix est en train de monter — surveille ta position !");
+            if (ok) alertedPositions[keyUpper] = now;
         }
     } else { alertedPositions[keyUpper] = 0; }
 }
@@ -356,5 +359,7 @@ async function safeCheck() {
     isChecking = true;
     try { await check(); } finally { isChecking = false; }
 }
+console.log("🤖 EVM Bot démarré");
+console.log("📱 Telegram token longueur:", TELEGRAM_TOKEN.length, "| CHAT_ID:", CHAT_ID);
 setInterval(safeCheck, CHECK_INTERVAL);
 safeCheck();
