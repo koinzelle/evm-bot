@@ -328,18 +328,19 @@ async function sendAlert(msg) {
 
 async function check() {
     console.log("\n--- Verification ---");
+    const OOR_COOLDOWN = 10 * 60 * 1000; // rappel toutes les 10 min si toujours hors range
     const veloTick = await getPoolTick(SONEIUM_RPC, VELODROME_POOL);
     if (veloTick !== null) {
         const inRange = veloTick >= VELODROME_TICK_LOWER && veloTick <= VELODROME_TICK_UPPER;
         console.log("Velodrome WBTC/WETH | Tick: " + veloTick + " | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
-        if (!inRange && !alertedPositions["velodrome"]) {
+        if (!inRange && (!alertedPositions["velodrome"] || Date.now() - alertedPositions["velodrome"] > OOR_COOLDOWN)) {
             const side = veloTick < VELODROME_TICK_LOWER ? "100% WBTC" : "100% WETH";
             if (await sendAlert("🚨 OUT OF RANGE!\n\nVelodrome WBTC/WETH\nTick: " + veloTick + "\nTu es: " + side + "\n\nAjuste ta position!"))
-                alertedPositions["velodrome"] = true;
+                alertedPositions["velodrome"] = Date.now();
         }
         if (inRange && alertedPositions["velodrome"]) {
             await sendAlert("✅ Retour IN RANGE\n\nVelodrome WBTC/WETH\nTick: " + veloTick);
-            alertedPositions["velodrome"] = false;
+            alertedPositions["velodrome"] = 0;
         }
         await checkNearRange("Velodrome WBTC/WETH (Soneium)", veloTick, VELODROME_TICK_LOWER, VELODROME_TICK_UPPER, "velodrome");
     }
@@ -351,14 +352,14 @@ async function check() {
         const inRange = tick >= pos.tickLower && tick <= pos.tickUpper;
         console.log(pos.poolName + " #" + pos.tokenId + " | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (inRange ? "IN RANGE" : "OUT OF RANGE"));
         const key = "prjx_" + pos.tokenId;
-        if (!inRange && !alertedPositions[key]) {
+        if (!inRange && (!alertedPositions[key] || Date.now() - alertedPositions[key] > OOR_COOLDOWN)) {
             const side = tick < pos.tickLower ? "100% HYPE" : "100% uBTC/upump";
             if (await sendAlert("🚨 OUT OF RANGE!\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick + "\nRange: [" + pos.tickLower + ", " + pos.tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!"))
-                alertedPositions[key] = true;
+                alertedPositions[key] = Date.now();
         }
         if (inRange && alertedPositions[key]) {
             await sendAlert("✅ Retour IN RANGE\n\n" + pos.poolName + " #" + pos.tokenId + "\nTick: " + tick);
-            alertedPositions[key] = false;
+            alertedPositions[key] = 0;
         }
         await checkNearRange(pos.poolName + " #" + pos.tokenId + " (Hyperliquid)", tick, pos.tickLower, pos.tickUpper, key);
     }
@@ -375,14 +376,14 @@ async function check() {
         const inRange = tick >= pos.tickLower && tick <= pos.tickUpper;
         console.log(pos.poolName + " #" + pos.tokenId + " | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (inRange ? "IN RANGE" : "⚠️ OUT OF RANGE"));
         const key = "satsuma_" + pos.tokenId;
-        if (!inRange && !alertedPositions[key]) {
+        if (!inRange && (!alertedPositions[key] || Date.now() - alertedPositions[key] > OOR_COOLDOWN)) {
             const side = tick < pos.tickLower ? "100% cBTC" : "100% ctUSD";
             if (await sendAlert("🚨 OUT OF RANGE!\n\nSatsuma cBTC/ctUSD #" + pos.tokenId + "\nTick: " + tick + "\nRange: [" + pos.tickLower + ", " + pos.tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!"))
-                alertedPositions[key] = true;
+                alertedPositions[key] = Date.now();
         }
         if (inRange && alertedPositions[key]) {
             await sendAlert("✅ Retour IN RANGE\n\nSatsuma cBTC/ctUSD #" + pos.tokenId + "\nTick: " + tick);
-            alertedPositions[key] = false;
+            alertedPositions[key] = 0;
         }
         await checkNearRange("Satsuma cBTC/ctUSD #" + pos.tokenId + " (Citrea)", tick, pos.tickLower, pos.tickUpper, key);
     }
