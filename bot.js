@@ -19,6 +19,7 @@ const HF_ALERT_THRESHOLD  = 1.15;
 
 const PRJX_NFPM           = "0xeaD19AE861c29bBb2101E834922B2FEee69B9091";
 const SATSUMA_NFPM        = "0x69D57B9D705eaD73a5d2f2476C30c55bD755cc2F";
+const SATSUMA_IGNORED_IDS = new Set([3231]); // positions dust/vides à ignorer
 const SATSUMA_CBTC_CTUSD_POOL = "0x5d4b518984ae9778479ee2ea782b9925bbf17080";
 const VELODROME_POOL      = "0xc6b8e3559feb231d7769c12872ffbe95c3e20ff7";
 const VELODROME_TICK_LOWER = 264247;
@@ -157,6 +158,7 @@ async function getSatsumaActivePositions() {
             const indexHex = i.toString(16).padStart(64, "0");
             const tokenIdHex = await rpcCall(CITREA_RPC, SATSUMA_NFPM, "0x2f745c59" + WALLET_NO_PREFIX + indexHex);
             const tokenId = parseInt(tokenIdHex, 16);
+            if (SATSUMA_IGNORED_IDS.has(tokenId)) { skipped++; continue; }
             const posData = await rpcCall(CITREA_RPC, SATSUMA_NFPM, "0x99fbab88" + tokenId.toString(16).padStart(64, "0"));
             if (!posData || posData === "0x") { emptyStreak++; continue; }
             const data = posData.slice(2);
