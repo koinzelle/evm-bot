@@ -22,6 +22,7 @@ const SATSUMA_NFPM        = "0x69D57B9D705eaD73a5d2f2476C30c55bD755cc2F";
 const SATSUMA_IGNORED_IDS = new Set([3231]); // positions dust/vides à ignorer
 const SATSUMA_CBTC_CTUSD_POOL = "0x5d4b518984ae9778479ee2ea782b9925bbf17080";
 const VELODROME_NFPM      = "0x991d5546c4b442b4c5fdc4c8b8b8d131deb24702";
+const VELODROME_GAUGE     = "0x9659d8C3371bBEA56e083F4e497c0b5097519509";
 const VELODROME_POOL      = "0xc6b8e3559feb231d7769c12872ffbe95c3e20ff7";
 const HYPE_UBTC_POOL      = "0x0D6ECB912b6ee160e95Bc198b618Acc1bCb92525";
 const UPUMP_HYPE_POOL     = "0x78cc152a531dbde2f3fe7001ad659fa120fa893b";
@@ -105,30 +106,37 @@ function checkOorAlert(key, inRange, alertMsg, returnMsg) {
     return Promise.resolve();
 }
 
-// ── Positions Velodrome (Soneium) ─────────────────────────────
+// ── Positions Velodrome (Soneium) — lecture via Blockscout + NFPM ─────────────
 
 async function getVelodromeActivePositions() {
     try {
-        const balanceHex = await rpcCall(SONEIUM_RPC, VELODROME_NFPM, "0x70a08231" + WALLET_NO_PREFIX);
-        const balance = parseInt(balanceHex, 16);
-        if (!balance || balance === 0) return [];
+        // Trouver les tokenIds stakés : NFT transférés wallet→gauge et pas encore retirés
+        const res = await axios.get("https://soneium.blockscout.com/api", {
+            params: { module: "account", action: "tokennfttx", contractaddress: VELODROME_NFPM, address: WALLET, page: 1, offset: 50 },
+            timeout: 10000,
+        });
+        const txs = res.data?.result || [];
+        const walletL = WALLET.toLowerCase(), gaugeL = VELODROME_GAUGE.toLowerCase();
+        const staked = new Set(), unstaked = new Set();
+        for (const tx of txs) {
+            const tid = parseInt(tx.tokenID);
+            if (isNaN(tid)) continue;
+            if (tx.from?.toLowerCase() === walletL && tx.to?.toLowerCase() === gaugeL) staked.add(tid);
+            if (tx.from?.toLowerCase() === gaugeL  && tx.to?.toLowerCase() === walletL) unstaked.add(tid);
+        }
+        const activeIds = [...staked].filter(id => !unstaked.has(id));
+
         const positions = [];
-        let skipped = 0, emptyStreak = 0;
-        for (let i = balance - 1; i >= 0 && emptyStreak < 15; i--) {
-            const indexHex = i.toString(16).padStart(64, "0");
-            const tokenIdHex = await rpcCall(SONEIUM_RPC, VELODROME_NFPM, "0x2f745c59" + WALLET_NO_PREFIX + indexHex);
-            const tokenId = parseInt(tokenIdHex, 16);
+        for (const tokenId of activeIds) {
             const posData = await rpcCall(SONEIUM_RPC, VELODROME_NFPM, "0x99fbab88" + tokenId.toString(16).padStart(64, "0"));
-            if (!posData || posData === "0x") { emptyStreak++; continue; }
+            if (!posData || posData === "0x") continue;
             const data = posData.slice(2);
-            const tickLower = decodeTick(data.slice(320, 384));
-            const tickUpper = decodeTick(data.slice(384, 448));
-            const liquidity = BigInt("0x" + data.slice(448, 512));
-            if (liquidity === 0n) { emptyStreak++; skipped++; continue; }
-            emptyStreak = 0;
+            const tickLower  = decodeTick(data.slice(320, 384));
+            const tickUpper  = decodeTick(data.slice(384, 448));
+            const liquidity  = BigInt("0x" + data.slice(448, 512));
+            if (liquidity === 0n) continue;
             positions.push({ tokenId, tickLower, tickUpper, poolName: "Velodrome WBTC/WETH", pool: VELODROME_POOL });
         }
-        if (skipped > 0) console.log("  (" + skipped + " NFTs Velodrome inactifs ignorés)");
         return positions;
     } catch (err) {
         console.log("Erreur positions Velodrome:", err.message);
