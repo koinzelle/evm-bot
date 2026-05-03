@@ -21,9 +21,8 @@ const PRJX_NFPM           = "0xeaD19AE861c29bBb2101E834922B2FEee69B9091";
 const SATSUMA_NFPM        = "0x69D57B9D705eaD73a5d2f2476C30c55bD755cc2F";
 const SATSUMA_IGNORED_IDS = new Set([3231]); // positions dust/vides à ignorer
 const SATSUMA_CBTC_CTUSD_POOL = "0x5d4b518984ae9778479ee2ea782b9925bbf17080";
+const VELODROME_NFPM      = "0x991d5546c4b442b4c5fdc4c8b8b8d131deb24702";
 const VELODROME_POOL      = "0xc6b8e3559feb231d7769c12872ffbe95c3e20ff7";
-const VELODROME_TICK_LOWER = 264247;
-const VELODROME_TICK_UPPER = 265547;
 const HYPE_UBTC_POOL      = "0x0D6ECB912b6ee160e95Bc198b618Acc1bCb92525";
 const UPUMP_HYPE_POOL     = "0x78cc152a531dbde2f3fe7001ad659fa120fa893b";
 const UBTC  = "9fdbda0a5e284c32744d2f17ee5c74b284993463";
@@ -104,6 +103,37 @@ function checkOorAlert(key, inRange, alertMsg, returnMsg) {
         return sendAlert(returnMsg);
     }
     return Promise.resolve();
+}
+
+// ── Positions Velodrome (Soneium) ─────────────────────────────
+
+async function getVelodromeActivePositions() {
+    try {
+        const balanceHex = await rpcCall(SONEIUM_RPC, VELODROME_NFPM, "0x70a08231" + WALLET_NO_PREFIX);
+        const balance = parseInt(balanceHex, 16);
+        if (!balance || balance === 0) return [];
+        const positions = [];
+        let skipped = 0, emptyStreak = 0;
+        for (let i = balance - 1; i >= 0 && emptyStreak < 15; i--) {
+            const indexHex = i.toString(16).padStart(64, "0");
+            const tokenIdHex = await rpcCall(SONEIUM_RPC, VELODROME_NFPM, "0x2f745c59" + WALLET_NO_PREFIX + indexHex);
+            const tokenId = parseInt(tokenIdHex, 16);
+            const posData = await rpcCall(SONEIUM_RPC, VELODROME_NFPM, "0x99fbab88" + tokenId.toString(16).padStart(64, "0"));
+            if (!posData || posData === "0x") { emptyStreak++; continue; }
+            const data = posData.slice(2);
+            const tickLower = decodeTick(data.slice(320, 384));
+            const tickUpper = decodeTick(data.slice(384, 448));
+            const liquidity = BigInt("0x" + data.slice(448, 512));
+            if (liquidity === 0n) { emptyStreak++; skipped++; continue; }
+            emptyStreak = 0;
+            positions.push({ tokenId, tickLower, tickUpper, poolName: "Velodrome WBTC/WETH", pool: VELODROME_POOL });
+        }
+        if (skipped > 0) console.log("  (" + skipped + " NFTs Velodrome inactifs ignorés)");
+        return positions;
+    } catch (err) {
+        console.log("Erreur positions Velodrome:", err.message);
+        return [];
+    }
 }
 
 // ── Positions PRJX (Hyperliquid) ──────────────────────────────
@@ -319,14 +349,15 @@ async function checkLpPosition(poolName, tick, tickLower, tickUpper, key, rpc) {
 async function check() {
     console.log("\n--- Verification ---");
 
-    // Étape 1 : fetch positions + tick Velodrome en parallèle
-    const [veloTick, prjxPositions, satsumaPositions] = await Promise.all([
-        getPoolTick(SONEIUM_RPC, VELODROME_POOL),
+    // Étape 1 : fetch positions en parallèle
+    const [velodromePositions, prjxPositions, satsumaPositions] = await Promise.all([
+        getVelodromeActivePositions(),
         getPrjxActivePositions(),
         getSatsumaActivePositions(),
     ]);
 
     // Étape 2 : fetch ticks LP + lending en parallèle
+    const veloTick = velodromePositions.length > 0 ? await getPoolTick(SONEIUM_RPC, VELODROME_POOL) : null;
     const prjxTickPromises = prjxPositions.map(pos => getPoolTick(HYPERVM_RPC, pos.pool));
     const satsumaTickPromises = satsumaPositions.map(pos => getAlgebraPoolTick(CITREA_RPC, pos.pool));
 
@@ -336,8 +367,11 @@ async function check() {
     ]);
 
     // Étape 3 : alertes LP
-    console.log("Velodrome WBTC/WETH | Tick: " + veloTick + " | " + (veloTick !== null ? (veloTick >= VELODROME_TICK_LOWER && veloTick <= VELODROME_TICK_UPPER ? "IN RANGE" : "⚠️ OUT OF RANGE") : "❌ RPC KO"));
-    await checkLpPosition("Velodrome WBTC/WETH (Soneium)", veloTick, VELODROME_TICK_LOWER, VELODROME_TICK_UPPER, "velodrome");
+    console.log("Velodrome: " + velodromePositions.length + " positions actives");
+    for (const pos of velodromePositions) {
+        console.log("Velodrome WBTC/WETH #" + pos.tokenId + " | Tick: " + veloTick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (veloTick !== null ? (veloTick >= pos.tickLower && veloTick <= pos.tickUpper ? "IN RANGE" : "⚠️ OUT OF RANGE") : "❌ RPC KO"));
+        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Soneium)", veloTick, pos.tickLower, pos.tickUpper, "velodrome_" + pos.tokenId);
+    }
 
     console.log("PRJX: " + prjxPositions.length + " positions actives");
     for (let i = 0; i < prjxPositions.length; i++) {
