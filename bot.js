@@ -1,4 +1,6 @@
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim().replace(/^[^0-9]+/, '');
 const CHAT_ID        = (process.env.CHAT_ID || '').trim();
@@ -407,3 +409,16 @@ console.log("🤖 EVM Bot démarré");
 console.log("📱 Telegram token longueur:", TELEGRAM_TOKEN.length, "| CHAT_ID:", CHAT_ID);
 setInterval(safeCheck, CHECK_INTERVAL);
 safeCheck();
+
+// Rotation bot.log toutes les heures — garde les 5000 dernières lignes si > 2MB
+setInterval(() => {
+    const logPath = path.join(__dirname, 'bot.log');
+    try {
+        if (!fs.existsSync(logPath)) return;
+        const stats = fs.statSync(logPath);
+        if (stats.size < 2 * 1024 * 1024) return;
+        const lines = fs.readFileSync(logPath, 'utf8').split('\n');
+        fs.writeFileSync(logPath, lines.slice(-5000).join('\n'));
+        console.log(`🗂️ bot.log tronqué — ${lines.length} → 5000 lignes`);
+    } catch (e) { /* silencieux */ }
+}, 60 * 60 * 1000);
