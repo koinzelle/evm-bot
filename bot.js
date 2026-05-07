@@ -239,11 +239,12 @@ async function checkSakeLending() {
         if (totalDebt < 1) return;
         const key = "sake_hf";
         if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-            if (await sendAlert("🚨 LIQUIDATION RISK!\n\nSake Finance (Soneium)\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !"))
+            const urgence = hf < 1.05 ? "🔴 CRITIQUE" : hf < 1.10 ? "🟠 TRÈS ÉLEVÉE" : "🟡 ÉLEVÉE";
+            if (await sendAlert(`🚨 LIQUIDATION RISK — Sake Finance (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)} / seuil ${HF_ALERT_THRESHOLD}\n💸 Dette         : $${totalDebt.toFixed(2)}\n⚡ Urgence       : ${urgence}\n\nRembourse ou ajoute du collatéral immédiatement !`))
                 alertedPositions[key] = true;
         }
         if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
-            await sendAlert("✅ Sake Finance OK\nHealth Factor: " + hf.toFixed(4));
+            await sendAlert(`✅ Sake Finance — Risque écarté (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${totalDebt.toFixed(2)}`);
             alertedPositions[key] = false;
         }
     } catch (err) { console.log("Erreur Sake:", err.message); }
@@ -265,11 +266,12 @@ async function checkMorphoLending() {
             const key = "morpho_" + m.uniqueKey?.slice(0, 10);
             console.log("Morpho " + label + " | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
             if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-                if (await sendAlert("🚨 LIQUIDATION RISK!\n\nMorpho Blue (Katana)\nMarché: " + label + "\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !"))
+                const urgence = hf < 1.05 ? "🔴 CRITIQUE" : hf < 1.10 ? "🟠 TRÈS ÉLEVÉE" : "🟡 ÉLEVÉE";
+                if (await sendAlert(`🚨 LIQUIDATION RISK — Morpho Blue (Katana)\n\n📊 Marché        : ${label}\n❤️ Health Factor : ${hf.toFixed(4)} / seuil ${HF_ALERT_THRESHOLD}\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${urgence}\n\nRembourse ou ajoute du collatéral immédiatement !`))
                     alertedPositions[key] = true;
             }
             if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
-                await sendAlert("✅ Morpho " + label + " OK\nHealth Factor: " + hf.toFixed(4));
+                await sendAlert(`✅ Morpho ${label} — Risque écarté (Katana)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
                 alertedPositions[key] = false;
             }
         }
@@ -300,11 +302,12 @@ async function checkListaLending() {
         console.log("Lista Moolah slisBNB/USD1 | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
         const key = "lista_slisBNB_USD1";
         if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-            if (await sendAlert("🚨 LIQUIDATION RISK!\n\nLista DAO Moolah (BSC)\nMarché: slisBNB/USD1\nHealth Factor: " + hf.toFixed(4) + "\nSeuil: " + HF_ALERT_THRESHOLD + "\n\nRembourse ou ajoute du collatéral !"))
+            const urgence = hf < 1.05 ? "🔴 CRITIQUE" : hf < 1.10 ? "🟠 TRÈS ÉLEVÉE" : "🟡 ÉLEVÉE";
+            if (await sendAlert(`🚨 LIQUIDATION RISK — Lista DAO Moolah (BSC)\n\n📊 Marché        : slisBNB/USD1\n❤️ Health Factor : ${hf.toFixed(4)} / seuil ${HF_ALERT_THRESHOLD}\n💸 Dette         : $${borUsd.toFixed(2)}\n⚡ Urgence       : ${urgence}\n\nRembourse ou ajoute du collatéral immédiatement !`))
                 alertedPositions[key] = true;
         }
         if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
-            await sendAlert("✅ Lista Moolah slisBNB/USD1 OK\nHealth Factor: " + hf.toFixed(4));
+            await sendAlert(`✅ Lista Moolah slisBNB/USD1 — Risque écarté (BSC)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
             alertedPositions[key] = false;
         }
     } catch (err) { console.log("Erreur Lista:", err.message); }
@@ -324,13 +327,15 @@ async function checkNearRange(poolName, tick, tickLower, tickUpper, key) {
     const keyUpper   = key + "_near_upper";
     if (tick < tickLower + alertZone) {
         if (!alertedPositions[keyLower] || now - alertedPositions[keyLower] > COOLDOWN) {
-            const ok = await sendAlert("⚠️ PROCHE SORTIE DE RANGE — côté BAS\n\n" + poolName + "\nTick actuel : " + tick + "\nBorne basse  : " + tickLower + "\nIl reste " + pctToLower + "% avant sortie\n\nLe prix est en train de baisser — surveille ta position !");
+            const ticksLeft = tick - tickLower;
+            const ok = await sendAlert(`⚠️ PROCHE BORNE BASSE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne basse  : ${tickLower}\n📊 Reste        : ${pctToLower}% (${ticksLeft} ticks)\n\nLe prix baisse — surveille ta position !`);
             if (ok) alertedPositions[keyLower] = now;
         }
     } else { alertedPositions[keyLower] = 0; }
     if (tick > tickUpper - alertZone) {
         if (!alertedPositions[keyUpper] || now - alertedPositions[keyUpper] > COOLDOWN) {
-            const ok = await sendAlert("⚠️ PROCHE SORTIE DE RANGE — côté HAUT\n\n" + poolName + "\nTick actuel : " + tick + "\nBorne haute  : " + tickUpper + "\nIl reste " + pctToUpper + "% avant sortie\n\nLe prix est en train de monter — surveille ta position !");
+            const ticksLeft = tickUpper - tick;
+            const ok = await sendAlert(`⚠️ PROCHE BORNE HAUTE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne haute  : ${tickUpper}\n📊 Reste        : ${pctToUpper}% (${ticksLeft} ticks)\n\nLe prix monte — surveille ta position !`);
             if (ok) alertedPositions[keyUpper] = now;
         }
     } else { alertedPositions[keyUpper] = 0; }
@@ -344,12 +349,15 @@ async function checkLpPosition(poolName, tick, tickLower, tickUpper, key, rpc) {
         return;
     }
     const inRange = tick >= tickLower && tick <= tickUpper;
-    console.log(poolName + " | Tick: " + tick + " | Range: [" + tickLower + ", " + tickUpper + "] | " + (inRange ? "IN RANGE" : "⚠️ OUT OF RANGE"));
-    const side = tick < tickLower ? "côté BAS" : "côté HAUT";
+    const rangeWidth = tickUpper - tickLower;
+    const pctInRange = inRange ? ((tick - tickLower) / rangeWidth * 100).toFixed(1) : null;
+    console.log(poolName + " | Tick: " + tick + " | Range: [" + tickLower + ", " + tickUpper + "] | " + (inRange ? `IN RANGE (${pctInRange}%)` : "⚠️ OUT OF RANGE"));
+    const side = tick < tickLower ? "BAS" : "HAUT";
+    const dist = tick < tickLower ? tickLower - tick : tick - tickUpper;
     await checkOorAlert(
         key, inRange,
-        "🚨 OUT OF RANGE!\n\n" + poolName + "\nTick: " + tick + "\nRange: [" + tickLower + ", " + tickUpper + "]\nTu es: " + side + "\n\nAjuste ta position!",
-        "✅ Retour IN RANGE\n\n" + poolName + "\nTick: " + tick
+        `🚨 OUT OF RANGE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Range       : [${tickLower}, ${tickUpper}]\n↕️ Côté        : ${side} (${dist} ticks hors range)\n\nAjuste ou retire ta position !`,
+        `✅ Retour IN RANGE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Range       : [${tickLower}, ${tickUpper}]\n📊 Position    : ${pctInRange ?? '?'}% dans le range`
     );
     await checkNearRange(poolName, tick, tickLower, tickUpper, key);
 }
