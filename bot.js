@@ -28,8 +28,10 @@ const VELODROME_GAUGE     = "0x9659d8C3371bBEA56e083F4e497c0b5097519509";
 const VELODROME_POOL      = "0xc6b8e3559feb231d7769c12872ffbe95c3e20ff7";
 const HYPE_UBTC_POOL      = "0x0D6ECB912b6ee160e95Bc198b618Acc1bCb92525";
 const UPUMP_HYPE_POOL     = "0x78cc152a531dbde2f3fe7001ad659fa120fa893b";
+const KHYPE_UBTC_POOL     = "0x467364bd2a633208b4534f5b7ec11d24604546e4"; // PRJX 0.3% fee
 const UBTC  = "9fdbda0a5e284c32744d2f17ee5c74b284993463";
 const UPUMP = "27ec642013bcb3d80ca3706599d3cda04f6f4452";
+const KHYPE = "fd739d4e423301ce9385c1fb8850539d657c296d"; // Kinetiq Staked HYPE
 
 const OOR_COOLDOWN        = 10 * 60 * 1000; // rappel hors range toutes les 10 min
 const CHECK_INTERVAL      = 60 * 1000;      // cycle toutes les 60s
@@ -166,15 +168,24 @@ async function getPrjxActivePositions() {
             emptyStreak = 0;
             const token0 = data.slice(128, 192).slice(24).toLowerCase();
             const token1 = data.slice(192, 256).slice(24).toLowerCase();
-            const isUbtc  = token0.includes(UBTC)  || token1.includes(UBTC);
-            const isUpump = token0.includes(UPUMP) || token1.includes(UPUMP);
-            if (!isUbtc && !isUpump) continue;
+            const hasUbtc  = token0.includes(UBTC)  || token1.includes(UBTC);
+            const hasUpump = token0.includes(UPUMP) || token1.includes(UPUMP);
+            const hasKhype = token0.includes(KHYPE) || token1.includes(KHYPE);
+            // Distinguer KHYPE/UBTC vs HYPE/UBTC : si KHYPE est présent avec UBTC, c'est la pool kHYPE
+            const isKhypeUbtc = hasKhype && hasUbtc;
+            const isHypeUbtc = hasUbtc && !hasKhype; // UBTC sans KHYPE = pool HYPE classique
+            const isUpump = hasUpump;
+            if (!isKhypeUbtc && !isHypeUbtc && !isUpump) continue;
+            let poolName, pool;
+            if (isKhypeUbtc) { poolName = "PRJX kHYPE/uBTC"; pool = KHYPE_UBTC_POOL; }
+            else if (isHypeUbtc) { poolName = "PRJX HYPE/uBTC"; pool = HYPE_UBTC_POOL; }
+            else { poolName = "PRJX upump/HYPE"; pool = UPUMP_HYPE_POOL; }
             positions.push({
                 tokenId,
                 tickLower: decodeTick(data.slice(320, 384)),
                 tickUpper: decodeTick(data.slice(384, 448)),
-                poolName: isUbtc ? "PRJX HYPE/uBTC" : "PRJX upump/HYPE",
-                pool: isUbtc ? HYPE_UBTC_POOL : UPUMP_HYPE_POOL,
+                poolName,
+                pool,
             });
         }
         if (skipped > 0) console.log("  (" + skipped + " NFTs inactifs ignorés)");
