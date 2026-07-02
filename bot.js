@@ -324,32 +324,36 @@ async function checkListaLending() {
     } catch (err) { console.log("Erreur Lista:", err.message); }
 }
 
-// ── Alerte proximité de range (10% de la borne) ───────────────
+// ── Alerte proximité de range — paliers 20% → 15% → 10%, puis rappel horaire ──
+// 1 notif par palier franchi (si le prix saute direct de 25% à 8%, une seule notif "palier 10%").
+// Une fois au palier 10% : 1 rappel par heure max tant qu'on y reste. Reset quand on repasse > 20%.
+
+const NEAR_LEVELS      = [20, 15, 10];      // % de range restant avant la borne
+const NEAR_REMINDER_MS = 60 * 60 * 1000;    // rappel horaire après le dernier palier
+
+async function checkNearSide(poolName, tick, bound, boundLabel, pctLeft, ticksLeft, trendMsg, key) {
+    const now = Date.now();
+    const st = alertedPositions[key];
+    if (pctLeft > NEAR_LEVELS[0]) { if (st) delete alertedPositions[key]; return; }
+    const level = Math.min(...NEAR_LEVELS.filter(L => pctLeft <= L)); // palier le plus profond atteint
+    if (!st || typeof st !== "object" || level < st.level) {
+        // nouveau palier franchi → notif immédiate
+        const ok = await sendAlert(`⚠️ PROCHE ${boundLabel} (palier ${level}%) — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
+        if (ok) alertedPositions[key] = { level, lastAt: now };
+    } else if (st.level === NEAR_LEVELS[NEAR_LEVELS.length - 1] && now - st.lastAt > NEAR_REMINDER_MS) {
+        // toujours collé à la borne depuis > 1h → rappel horaire, rien d'autre
+        const ok = await sendAlert(`⏰ RAPPEL — ${poolName} toujours proche ${boundLabel.toLowerCase()}\n\n📍 Tick actuel : ${tick}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)`);
+        if (ok) st.lastAt = now;
+    }
+}
 
 async function checkNearRange(poolName, tick, tickLower, tickUpper, key) {
     if (tick < tickLower || tick > tickUpper) return;
     const rangeWidth = tickUpper - tickLower;
-    const alertZone  = rangeWidth * 0.10;
-    const COOLDOWN   = 10 * 60 * 1000;
-    const now        = Date.now();
-    const pctToLower = ((tick - tickLower) / rangeWidth * 100).toFixed(1);
-    const pctToUpper = ((tickUpper - tick)  / rangeWidth * 100).toFixed(1);
-    const keyLower   = key + "_near_lower";
-    const keyUpper   = key + "_near_upper";
-    if (tick < tickLower + alertZone) {
-        if (!alertedPositions[keyLower] || now - alertedPositions[keyLower] > COOLDOWN) {
-            const ticksLeft = tick - tickLower;
-            const ok = await sendAlert(`⚠️ PROCHE BORNE BASSE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne basse  : ${tickLower}\n📊 Reste        : ${pctToLower}% (${ticksLeft} ticks)\n\nLe prix baisse — surveille ta position !`);
-            if (ok) alertedPositions[keyLower] = now;
-        }
-    } else { alertedPositions[keyLower] = 0; }
-    if (tick > tickUpper - alertZone) {
-        if (!alertedPositions[keyUpper] || now - alertedPositions[keyUpper] > COOLDOWN) {
-            const ticksLeft = tickUpper - tick;
-            const ok = await sendAlert(`⚠️ PROCHE BORNE HAUTE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne haute  : ${tickUpper}\n📊 Reste        : ${pctToUpper}% (${ticksLeft} ticks)\n\nLe prix monte — surveille ta position !`);
-            if (ok) alertedPositions[keyUpper] = now;
-        }
-    } else { alertedPositions[keyUpper] = 0; }
+    const pctToLower = (tick - tickLower) / rangeWidth * 100;
+    const pctToUpper = (tickUpper - tick)  / rangeWidth * 100;
+    await checkNearSide(poolName, tick, tickLower, "BORNE BASSE", pctToLower, tick - tickLower, "Le prix baisse — surveille ta position !", key + "_near_lower");
+    await checkNearSide(poolName, tick, tickUpper, "BORNE HAUTE", pctToUpper, tickUpper - tick, "Le prix monte — surveille ta position !", key + "_near_upper");
 }
 
 // ── Vérification LP positions ─────────────────────────────────
