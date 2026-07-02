@@ -324,11 +324,11 @@ async function checkListaLending() {
     } catch (err) { console.log("Erreur Lista:", err.message); }
 }
 
-// ── Alerte proximité de range — paliers 20% → 15% → 10%, puis rappel horaire ──
+// ── Alerte proximité de range — paliers 20% → 15% → 10% → 5%, puis rappel horaire ──
 // 1 notif par palier franchi (si le prix saute direct de 25% à 8%, une seule notif "palier 10%").
 // Une fois au palier 10% : 1 rappel par heure max tant qu'on y reste. Reset quand on repasse > 20%.
 
-const NEAR_LEVELS      = [20, 15, 10];      // % de range restant avant la borne
+const NEAR_LEVELS      = [20, 15, 10, 5];   // % de range restant avant la borne
 const NEAR_REMINDER_MS = 60 * 60 * 1000;    // rappel horaire après le dernier palier
 
 async function checkNearSide(poolName, tick, bound, boundLabel, pctLeft, ticksLeft, trendMsg, key) {
