@@ -17,7 +17,6 @@ const LISTA_MOOLAH        = "0x8f73b65b4caaf64fba2af91cc5d4a2a1318e5d8c";
 const LISTA_MARKET_ID     = "95f93825819b67a64610e6adb9ac5f70d5108f5121b9df6551e23a4a7a801b5b";
 const LISTA_ORACLE        = "0xF07b74724cC734079D9D1aa22fF7591B5A32D9d2";
 const LISTA_LLTV          = 860000000000000000n;
-const HF_ALERT_THRESHOLD  = 1.15;
 
 const PRJX_NFPM           = "0xeaD19AE861c29bBb2101E834922B2FEee69B9091";
 const SATSUMA_NFPM        = "0x69D57B9D705eaD73a5d2f2476C30c55bD755cc2F";
@@ -33,7 +32,7 @@ const UBTC  = "9fdbda0a5e284c32744d2f17ee5c74b284993463";
 const UPUMP = "27ec642013bcb3d80ca3706599d3cda04f6f4452";
 const KHYPE = "fd739d4e423301ce9385c1fb8850539d657c296d"; // Kinetiq Staked HYPE
 
-const OOR_COOLDOWN        = 10 * 60 * 1000; // rappel hors range toutes les 10 min
+const OOR_COOLDOWN        = 60 * 60 * 1000; // rappel hors range toutes les heures
 const CHECK_INTERVAL      = 60 * 1000;      // cycle toutes les 60s
 
 let alertedPositions = {};
@@ -238,6 +237,31 @@ async function getSatsumaActivePositions() {
 }
 
 // ── Lending ───────────────────────────────────────────────────
+// Paliers HF progressifs (même logique que near-range) : 1 notif par palier franchi à la
+// baisse (1.15 → 1.10 → 1.05), rappel 1×/heure max au palier critique (< 1.05), reset +
+// message "risque écarté" quand le HF repasse ≥ 1.15.
+
+const HF_LEVELS      = [1.15, 1.10, 1.05];
+const HF_REMINDER_MS = 60 * 60 * 1000;
+
+function hfUrgence(level) {
+    return level === 1.05 ? "🔴 CRITIQUE" : level === 1.10 ? "🟠 TRÈS ÉLEVÉE" : "🟡 ÉLEVÉE";
+}
+
+async function checkHfAlert(key, hf, alertMsgFn, recoveryMsg) {
+    const now = Date.now();
+    const st = alertedPositions[key];
+    if (hf >= HF_LEVELS[0]) {
+        if (st) { delete alertedPositions[key]; await sendAlert(recoveryMsg); }
+        return;
+    }
+    const level = Math.min(...HF_LEVELS.filter(L => hf < L)); // palier le plus profond franchi
+    if (!st || typeof st !== "object" || level < st.level) {
+        if (await sendAlert(alertMsgFn(level, false))) alertedPositions[key] = { level, lastAt: now };
+    } else if (st.level === HF_LEVELS[HF_LEVELS.length - 1] && now - st.lastAt > HF_REMINDER_MS) {
+        if (await sendAlert(alertMsgFn(level, true))) st.lastAt = now;
+    }
+}
 
 async function checkSakeLending() {
     try {
@@ -248,16 +272,9 @@ async function checkSakeLending() {
         const totalDebt = Number(BigInt("0x" + hex.slice(64, 128))) / 1e8;
         console.log("Sake (Soneium) | HF: " + hf.toFixed(4) + " | Debt: $" + totalDebt.toFixed(2));
         if (totalDebt < 1) return;
-        const key = "sake_hf";
-        if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-            const urgence = hf < 1.05 ? "🔴 CRITIQUE" : hf < 1.10 ? "🟠 TRÈS ÉLEVÉE" : "🟡 ÉLEVÉE";
-            if (await sendAlert(`🚨 LIQUIDATION RISK — Sake Finance (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)} / seuil ${HF_ALERT_THRESHOLD}\n💸 Dette         : $${totalDebt.toFixed(2)}\n⚡ Urgence       : ${urgence}\n\nRembourse ou ajoute du collatéral immédiatement !`))
-                alertedPositions[key] = true;
-        }
-        if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
-            await sendAlert(`✅ Sake Finance — Risque écarté (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${totalDebt.toFixed(2)}`);
-            alertedPositions[key] = false;
-        }
+        await checkHfAlert("sake_hf", hf,
+            (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Sake Finance (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${totalDebt.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
+            `✅ Sake Finance — Risque écarté (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${totalDebt.toFixed(2)}`);
     } catch (err) { console.log("Erreur Sake:", err.message); }
 }
 
@@ -276,15 +293,9 @@ async function checkMorphoLending() {
             const label = (m.collateralAsset?.symbol || "?") + "/" + (m.loanAsset?.symbol || "?");
             const key = "morpho_" + m.uniqueKey?.slice(0, 10);
             console.log("Morpho " + label + " | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
-            if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-                const urgence = hf < 1.05 ? "🔴 CRITIQUE" : hf < 1.10 ? "🟠 TRÈS ÉLEVÉE" : "🟡 ÉLEVÉE";
-                if (await sendAlert(`🚨 LIQUIDATION RISK — Morpho Blue (Katana)\n\n📊 Marché        : ${label}\n❤️ Health Factor : ${hf.toFixed(4)} / seuil ${HF_ALERT_THRESHOLD}\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${urgence}\n\nRembourse ou ajoute du collatéral immédiatement !`))
-                    alertedPositions[key] = true;
-            }
-            if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
-                await sendAlert(`✅ Morpho ${label} — Risque écarté (Katana)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
-                alertedPositions[key] = false;
-            }
+            await checkHfAlert(key, hf,
+                (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Morpho Blue (Katana)\n\n📊 Marché        : ${label}\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
+                `✅ Morpho ${label} — Risque écarté (Katana)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
         }
     } catch (err) { console.log("Erreur Morpho:", err.message); }
 }
@@ -311,16 +322,9 @@ async function checkListaLending() {
         const hf = Number((collateral * price * LISTA_LLTV * 10000n) / (borrowAssets * (10n ** 36n) * (10n ** 18n))) / 10000;
         const borUsd = Number(borrowAssets) / 1e18;
         console.log("Lista Moolah slisBNB/USD1 | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
-        const key = "lista_slisBNB_USD1";
-        if (hf < HF_ALERT_THRESHOLD && !alertedPositions[key]) {
-            const urgence = hf < 1.05 ? "🔴 CRITIQUE" : hf < 1.10 ? "🟠 TRÈS ÉLEVÉE" : "🟡 ÉLEVÉE";
-            if (await sendAlert(`🚨 LIQUIDATION RISK — Lista DAO Moolah (BSC)\n\n📊 Marché        : slisBNB/USD1\n❤️ Health Factor : ${hf.toFixed(4)} / seuil ${HF_ALERT_THRESHOLD}\n💸 Dette         : $${borUsd.toFixed(2)}\n⚡ Urgence       : ${urgence}\n\nRembourse ou ajoute du collatéral immédiatement !`))
-                alertedPositions[key] = true;
-        }
-        if (hf >= HF_ALERT_THRESHOLD && alertedPositions[key]) {
-            await sendAlert(`✅ Lista Moolah slisBNB/USD1 — Risque écarté (BSC)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
-            alertedPositions[key] = false;
-        }
+        await checkHfAlert("lista_slisBNB_USD1", hf,
+            (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Lista DAO Moolah (BSC)\n\n📊 Marché        : slisBNB/USD1\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
+            `✅ Lista Moolah slisBNB/USD1 — Risque écarté (BSC)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
     } catch (err) { console.log("Erreur Lista:", err.message); }
 }
 
