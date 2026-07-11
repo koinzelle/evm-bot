@@ -31,9 +31,14 @@ const CITREA_RPC  = "https://rpc.mainnet.citrea.xyz";
 
 const SAKE_POOL           = "0x3C3987A310ee13F7B8cBBe21D97D4436ba5E4B5f";
 const LISTA_MOOLAH        = "0x8f73b65b4caaf64fba2af91cc5d4a2a1318e5d8c";
-const LISTA_MARKET_ID     = "95f93825819b67a64610e6adb9ac5f70d5108f5121b9df6551e23a4a7a801b5b";
-const LISTA_ORACLE        = "0xF07b74724cC734079D9D1aa22fF7591B5A32D9d2";
-const LISTA_LLTV          = 860000000000000000n;
+// Marché slisBNB(collatéral)/lisUSD(emprunt) — 2026-07-11, le user a migré depuis slisBNB/USD1.
+// Vérifié on-chain : idToMarketParams recompose exactement ce hash ; LLTV = 85%.
+const LISTA_MARKET_ID     = "7fe248d8459a88e50e8582c71219edbce1079437e58190aeab41ac503694f0a5";
+const LISTA_LLTV          = 850000000000000000n;
+// L'oracle Morpho de ce marché reverte en lecture directe (proxy Lista). On reconstruit le prix
+// slisBNB en USD : Chainlink BNB/USD × taux slisBNB→BNB (StakeManager). lisUSD ≈ $1 (stablecoin).
+const CHAINLINK_BNB_USD   = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE";
+const LISTA_STAKE_MANAGER = "0x1adB950d8bB3dA4bE104211D5AB038628e477fE6";
 
 const PRJX_NFPM           = "0xeaD19AE861c29bBb2101E834922B2FEee69B9091";
 const SATSUMA_NFPM        = "0x69D57B9D705eaD73a5d2f2476C30c55bD755cc2F";
@@ -323,30 +328,36 @@ async function checkMorphoLending() {
 
 async function checkListaLending() {
     try {
-        // 3 appels indépendants → en parallèle
-        const [posHex, mktHex, priceHex] = await Promise.all([
+        // 4 appels indépendants → en parallèle : position, marché, taux slisBNB→BNB, prix BNB/USD Chainlink
+        const one = (10n ** 18n).toString(16).padStart(64, "0");
+        const [posHex, mktHex, rateHex, bnbHex] = await Promise.all([
             rpcCall(BSC_RPC, LISTA_MOOLAH, "0x93c52062" + LISTA_MARKET_ID + "000000000000000000000000" + WALLET.replace("0x", "")),
             rpcCall(BSC_RPC, LISTA_MOOLAH, "0x5c60e39a" + LISTA_MARKET_ID),
-            rpcCall(BSC_RPC, LISTA_ORACLE,  "0x5e9a523c"),
+            rpcCall(BSC_RPC, LISTA_STAKE_MANAGER, "0xce6298e1" + one), // convertSnBnbToBnb(1e18)
+            rpcCall(BSC_RPC, CHAINLINK_BNB_USD, "0xfeaf968c"),         // latestRoundData()
         ]);
         if (!posHex || posHex === "0x") { console.log("Lista Moolah | Pas de données"); return; }
         const pd = posHex.slice(2);
         const borrowShares = BigInt("0x" + pd.slice(64, 128));
-        if (borrowShares === 0n) { console.log("Lista Moolah slisBNB/USD1 | Aucune dette"); return; }
-        const collateral = BigInt("0x" + pd.slice(128, 192));
+        if (borrowShares === 0n) { console.log("Lista Moolah slisBNB/lisUSD | Aucune dette"); return; }
+        const collateral = Number(BigInt("0x" + pd.slice(128, 192))) / 1e18; // slisBNB
         const md = mktHex.slice(2);
         const totalBorrowAssets = BigInt("0x" + md.slice(128, 192));
         const totalBorrowShares = BigInt("0x" + md.slice(192, 256));
-        const price = BigInt("0x" + priceHex.slice(2));
         const borrowAssets = totalBorrowShares > 0n ? (borrowShares * totalBorrowAssets) / totalBorrowShares : 0n;
         if (borrowAssets === 0n) { console.log("Lista Moolah | borrowAssets = 0"); return; }
-        const hf = Number((collateral * price * LISTA_LLTV * 10000n) / (borrowAssets * (10n ** 36n) * (10n ** 18n))) / 10000;
-        const borUsd = Number(borrowAssets) / 1e18;
-        console.log("Lista Moolah slisBNB/USD1 | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
-        lastStatus.lending.push({ name: "Lista slisBNB/USD1 (BSC)", hf: Number(hf.toFixed(4)), debt: Number(borUsd.toFixed(2)) });
-        await checkHfAlert("lista_slisBNB_USD1", hf,
-            (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Lista DAO Moolah (BSC)\n\n📊 Marché        : slisBNB/USD1\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
-            `✅ Lista Moolah slisBNB/USD1 — Risque écarté (BSC)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
+        const borUsd = Number(borrowAssets) / 1e18; // dette en lisUSD ≈ USD
+        // prix slisBNB en USD = taux(slisBNB→BNB) × BNB/USD
+        const rate = Number(BigInt(rateHex)) / 1e18;                                  // BNB par slisBNB
+        const bnbUsd = Number(BigInt("0x" + bnbHex.slice(2).slice(64, 128))) / 1e8;   // answer Chainlink (8 déc.)
+        const slisBnbUsd = rate * bnbUsd;
+        const colUsd = collateral * slisBnbUsd;
+        const hf = (colUsd * (Number(LISTA_LLTV) / 1e18)) / borUsd;
+        console.log("Lista Moolah slisBNB/lisUSD | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2) + " | Col: $" + colUsd.toFixed(2) + " (slisBNB $" + slisBnbUsd.toFixed(2) + ")");
+        lastStatus.lending.push({ name: "Lista slisBNB/lisUSD (BSC)", hf: Number(hf.toFixed(4)), debt: Number(borUsd.toFixed(2)) });
+        await checkHfAlert("lista_slisBNB_lisUSD", hf,
+            (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Lista DAO Moolah (BSC)\n\n📊 Marché        : slisBNB/lisUSD\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
+            `✅ Lista Moolah slisBNB/lisUSD — Risque écarté (BSC)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
     } catch (err) { console.log("Erreur Lista:", err.message); }
 }
 
