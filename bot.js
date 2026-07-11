@@ -1,6 +1,23 @@
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
+
+// ── Capture des logs pour /logs (sur Railway console.log part dans le flux Railway, pas de fichier) ──
+const LOG_BUFFER = [];
+const _origLog = console.log.bind(console), _origErr = console.error.bind(console);
+function _cap(fn, args) {
+    try {
+        LOG_BUFFER.push(`[${new Date().toISOString()}] ` + args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" "));
+        if (LOG_BUFFER.length > 3000) LOG_BUFFER.shift();
+    } catch (_) {}
+    fn(...args);
+}
+console.log = (...a) => _cap(_origLog, a);
+console.error = (...a) => _cap(_origErr, a);
+
+// État de la dernière vérif → exposé sur /status
+let lastStatus = { updatedAt: null, lp: [], lending: [] };
 
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim().replace(/^[^0-9]+/, '');
 const CHAT_ID        = (process.env.CHAT_ID || '').trim();
@@ -272,6 +289,7 @@ async function checkSakeLending() {
         const totalDebt = Number(BigInt("0x" + hex.slice(64, 128))) / 1e8;
         console.log("Sake (Soneium) | HF: " + hf.toFixed(4) + " | Debt: $" + totalDebt.toFixed(2));
         if (totalDebt < 1) return;
+        lastStatus.lending.push({ name: "Sake (Soneium)", hf: Number(hf.toFixed(4)), debt: Number(totalDebt.toFixed(2)) });
         await checkHfAlert("sake_hf", hf,
             (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Sake Finance (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${totalDebt.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
             `✅ Sake Finance — Risque écarté (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${totalDebt.toFixed(2)}`);
@@ -281,7 +299,8 @@ async function checkSakeLending() {
 async function checkMorphoLending() {
     try {
         const wallet = WALLET;
-        const query = `{ marketPositions(where: { userAddress_in: ["${wallet}"], chainId_in: [747474] }) { items { market { uniqueKey lltv collateralAsset { symbol } loanAsset { symbol } } state { collateralUsd borrowAssetsUsd } } } }`;
+        // Base (8453) + Katana (747474) — chainId multiple pour ne pas être aveugle si les positions bougent de chaîne
+        const query = `{ marketPositions(where: { userAddress_in: ["${wallet}"], chainId_in: [8453, 747474] }) { items { market { marketId lltv chain { network } collateralAsset { symbol } loanAsset { symbol } } state { collateralUsd borrowAssetsUsd } } } }`;
         const res = await axios.post("https://blue-api.morpho.org/graphql", { query }, { timeout: 10000 });
         const items = res.data?.data?.marketPositions?.items || [];
         for (const pos of items) {
@@ -291,11 +310,13 @@ async function checkMorphoLending() {
             if (borUsd < 1) continue;
             const hf = (colUsd * Number(BigInt(m.lltv || "0")) / 1e18) / borUsd;
             const label = (m.collateralAsset?.symbol || "?") + "/" + (m.loanAsset?.symbol || "?");
-            const key = "morpho_" + m.uniqueKey?.slice(0, 10);
-            console.log("Morpho " + label + " | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
+            const chainName = m.chain?.network || "?";
+            const key = "morpho_" + m.marketId?.slice(0, 10);
+            console.log("Morpho " + label + " (" + chainName + ") | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
+            lastStatus.lending.push({ name: "Morpho " + label + " (" + chainName + ")", hf: Number(hf.toFixed(4)), debt: Number(borUsd.toFixed(2)) });
             await checkHfAlert(key, hf,
-                (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Morpho Blue (Katana)\n\n📊 Marché        : ${label}\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
-                `✅ Morpho ${label} — Risque écarté (Katana)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
+                (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Morpho Blue (${chainName})\n\n📊 Marché        : ${label}\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
+                `✅ Morpho ${label} — Risque écarté (${chainName})\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
         }
     } catch (err) { console.log("Erreur Morpho:", err.message); }
 }
@@ -322,6 +343,7 @@ async function checkListaLending() {
         const hf = Number((collateral * price * LISTA_LLTV * 10000n) / (borrowAssets * (10n ** 36n) * (10n ** 18n))) / 10000;
         const borUsd = Number(borrowAssets) / 1e18;
         console.log("Lista Moolah slisBNB/USD1 | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
+        lastStatus.lending.push({ name: "Lista slisBNB/USD1 (BSC)", hf: Number(hf.toFixed(4)), debt: Number(borUsd.toFixed(2)) });
         await checkHfAlert("lista_slisBNB_USD1", hf,
             (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Lista DAO Moolah (BSC)\n\n📊 Marché        : slisBNB/USD1\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
             `✅ Lista Moolah slisBNB/USD1 — Risque écarté (BSC)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
@@ -344,9 +366,11 @@ async function checkNearSide(poolName, tick, bound, boundLabel, pctLeft, ticksLe
         // nouveau palier franchi → notif immédiate
         const ok = await sendAlert(`⚠️ PROCHE ${boundLabel} (palier ${level}%) — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
         if (ok) alertedPositions[key] = { level, lastAt: now };
-    } else if (st.level === NEAR_LEVELS[NEAR_LEVELS.length - 1] && now - st.lastAt > NEAR_REMINDER_MS) {
-        // toujours collé à la borne depuis > 1h → rappel horaire, rien d'autre
-        const ok = await sendAlert(`⏰ RAPPEL — ${poolName} toujours proche ${boundLabel.toLowerCase()}\n\n📍 Tick actuel : ${tick}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)`);
+    } else if (now - st.lastAt > NEAR_REMINDER_MS) {
+        // toujours dans une zone d'alerte (n'importe quel palier 20/15/10/5) depuis > 1h → rappel horaire
+        // avec l'état actuel. AVANT : ne rappelait qu'au palier 5% → une position collée à 8-12% restait
+        // muette après la 1re alerte (bug : LP kHYPE/uBTC à 8.9% jamais rappelée).
+        const ok = await sendAlert(`⏰ RAPPEL (palier ${st.level}%) — ${poolName} toujours proche ${boundLabel.toLowerCase()}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
         if (ok) st.lastAt = now;
     }
 }
@@ -370,6 +394,9 @@ async function checkLpPosition(poolName, tick, tickLower, tickUpper, key, rpc) {
     const inRange = tick >= tickLower && tick <= tickUpper;
     const rangeWidth = tickUpper - tickLower;
     const pctInRange = inRange ? ((tick - tickLower) / rangeWidth * 100).toFixed(1) : null;
+    // distance à la borne la plus proche (%) — pour /status
+    const nearestPct = inRange ? Math.min((tick - tickLower) / rangeWidth * 100, (tickUpper - tick) / rangeWidth * 100) : 0;
+    lastStatus.lp.push({ pool: poolName, tick, range: [tickLower, tickUpper], inRange, pctInRange: pctInRange ? Number(pctInRange) : null, distBornePct: Number(nearestPct.toFixed(1)) });
     console.log(poolName + " | Tick: " + tick + " | Range: [" + tickLower + ", " + tickUpper + "] | " + (inRange ? `IN RANGE (${pctInRange}%)` : "⚠️ OUT OF RANGE"));
     const side = tick < tickLower ? "BAS" : "HAUT";
     const dist = tick < tickLower ? tickLower - tick : tick - tickUpper;
@@ -385,6 +412,7 @@ async function checkLpPosition(poolName, tick, tickLower, tickUpper, key, rpc) {
 
 async function check() {
     console.log("\n--- Verification ---");
+    lastStatus = { updatedAt: new Date().toISOString(), lp: [], lending: [] };
 
     // Étape 1 : fetch positions en parallèle
     const [velodromePositions, prjxPositions, satsumaPositions] = await Promise.all([
@@ -436,6 +464,24 @@ console.log("🤖 EVM Bot démarré");
 console.log("📱 Telegram token longueur:", TELEGRAM_TOKEN.length, "| CHAT_ID:", CHAT_ID);
 setInterval(safeCheck, CHECK_INTERVAL);
 safeCheck();
+
+// ── Serveur HTTP : /status (état live des LP + lending) et /logs (buffer) ──────
+// Rend le domaine Railway joignable (sinon 502 — worker sans port) + visibilité distante.
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+    const url = (req.url || "/").split("?")[0];
+    if (url === "/logs") {
+        const tail = parseInt(new URL(req.url, "http://x").searchParams.get("tail") || "300", 10);
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(LOG_BUFFER.slice(-tail).join("\n"));
+    } else if (url === "/status") {
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(lastStatus, null, 2));
+    } else {
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("EVM alert bot OK\nEndpoints: /status  /logs?tail=N");
+    }
+}).listen(PORT, () => console.log("🌐 HTTP server on port " + PORT));
 
 // Rotation bot.log toutes les heures — garde les 5000 dernières lignes si > 2MB
 setInterval(() => {
