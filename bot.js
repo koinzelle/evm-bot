@@ -17,7 +17,7 @@ console.log = (...a) => _cap(_origLog, a);
 console.error = (...a) => _cap(_origErr, a);
 
 // État de la dernière vérif → exposé sur /status
-let lastStatus = { updatedAt: null, lp: [], lending: [] };
+let lastStatus = { updatedAt: null, lp: [], lending: [], perps: [] };
 
 const TELEGRAM_TOKEN = (process.env.TELEGRAM_TOKEN || '').trim().replace(/^[^0-9]+/, '');
 const CHAT_ID        = (process.env.CHAT_ID || '').trim();
@@ -339,17 +339,19 @@ function hfUrgence(level) {
     return level === 1.05 ? "🔴 CRITIQUE" : level === 1.10 ? "🟠 TRÈS ÉLEVÉE" : "🟡 ÉLEVÉE";
 }
 
-async function checkHfAlert(key, hf, alertMsgFn, recoveryMsg) {
+// (2026-09-17) `levels` en argument optionnel pour réutiliser la même mécanique sur les perps
+// (distance au prix de liquidation en %). Sans l'argument, comportement identique à avant.
+async function checkHfAlert(key, hf, alertMsgFn, recoveryMsg, levels = HF_LEVELS) {
     const now = Date.now();
     const st = alertedPositions[key];
-    if (hf >= HF_LEVELS[0]) {
+    if (hf >= levels[0]) {
         if (st) { delete alertedPositions[key]; await sendAlert(recoveryMsg); }
         return;
     }
-    const level = Math.min(...HF_LEVELS.filter(L => hf < L)); // palier le plus profond franchi
+    const level = Math.min(...levels.filter(L => hf < L)); // palier le plus profond franchi
     if (!st || typeof st !== "object" || level < st.level) {
         if (await sendAlert(alertMsgFn(level, false))) alertedPositions[key] = { level, lastAt: now };
-    } else if (st.level === HF_LEVELS[HF_LEVELS.length - 1] && now - st.lastAt > HF_REMINDER_MS) {
+    } else if (st.level === levels[levels.length - 1] && now - st.lastAt > HF_REMINDER_MS) {
         if (await sendAlert(alertMsgFn(level, true))) st.lastAt = now;
     }
 }
@@ -437,6 +439,58 @@ async function checkListaLending() {
 const NEAR_LEVELS      = [20, 15, 10, 5];   // % de range restant avant la borne
 const NEAR_REMINDER_MS = 60 * 60 * 1000;    // rappel horaire après le dernier palier
 
+// ── Perps Hyperliquid — API publique, aucune clé ──────────────────────────────
+// `clearinghouseState` donne par position : taille signée (szi), prix d'entrée, levier,
+// PRIX DE LIQUIDATION et PnL non réalisé. Le prix mark se déduit de positionValue / |szi|,
+// ce qui évite un second appel. Vérifié le 17/09 sur le wallet : l'endpoint répond sans clé.
+// Paliers en % de distance au prix de liquidation, même mécanique que les Health Factor.
+const HL_API_URL       = "https://api.hyperliquid.xyz/info";
+const PERP_LIQ_LEVELS  = [20, 15, 10, 5];
+
+function liqUrgence(level) {
+    return level === 5 ? "🔴 CRITIQUE" : level === 10 ? "🟠 TRÈS ÉLEVÉE" : level === 15 ? "🟡 ÉLEVÉE" : "🔵 À SURVEILLER";
+}
+
+async function checkHyperliquidPerps() {
+    try {
+        const res = await axios.post(HL_API_URL, { type: "clearinghouseState", user: WALLET }, { timeout: 10000 });
+        const positions = (res.data?.assetPositions || []).map(p => p.position)
+            .filter(q => q && parseFloat(q.szi) !== 0);
+        console.log("Hyperliquid perps: " + positions.length + " position(s)");
+        for (const q of positions) {
+            const szi = parseFloat(q.szi);
+            const liq = q.liquidationPx != null ? parseFloat(q.liquidationPx) : null;
+            const mark = q.positionValue != null ? Math.abs(parseFloat(q.positionValue) / szi) : null;
+            const sens = szi > 0 ? "LONG" : "SHORT";
+            const lev = q.leverage?.value ?? "?";
+            const pnl = q.unrealizedPnl != null ? parseFloat(q.unrealizedPnl) : null;
+            if (liq == null || !liq || mark == null || !(mark > 0)) {
+                console.log("  " + q.coin + " " + sens + " | prix de liquidation illisible — pas d'alerte");
+                continue;
+            }
+            const dist = Math.abs(mark - liq) / mark * 100;
+            console.log("  " + q.coin + " " + sens + " x" + lev + " | mark " + mark.toPrecision(6)
+                + " | liq " + liq.toPrecision(6) + " | distance " + dist.toFixed(1) + "% | PnL "
+                + (pnl != null ? (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + "$" : "?"));
+            lastStatus.perps.push({ venue: "Hyperliquid", coin: q.coin, sens, levier: lev,
+                taille: szi, mark: Number(mark.toPrecision(8)), liq: Number(liq.toPrecision(8)),
+                distLiqPct: Number(dist.toFixed(2)), pnl });
+            await checkHfAlert("hlperp_" + q.coin, dist,
+                (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION PROCHE — ${q.coin} ${sens} x${lev} (Hyperliquid)\n\n`
+                    + `📍 Prix mark      : ${mark.toPrecision(6)}\n`
+                    + `💀 Liquidation    : ${liq.toPrecision(6)}\n`
+                    + `📏 Distance       : ${dist.toFixed(1)}% (palier < ${level}%)\n`
+                    + `💰 PnL non réalisé: ${pnl != null ? (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + "$" : "?"}\n`
+                    + `⚡ Urgence        : ${liqUrgence(level)}\n\nRéduis la position ou ajoute de la marge !`,
+                `✅ ${q.coin} ${sens} — Risque de liquidation écarté (Hyperliquid)\n\n`
+                    + `📍 Mark ${mark.toPrecision(6)} · Liq ${liq.toPrecision(6)} · Distance ${dist.toFixed(1)}%`,
+                PERP_LIQ_LEVELS);
+        }
+    } catch (err) {
+        console.log("Erreur perps Hyperliquid:", err.message);
+    }
+}
+
 async function checkNearSide(poolName, tick, bound, boundLabel, pctLeft, ticksLeft, trendMsg, key) {
     const now = Date.now();
     const st = alertedPositions[key];
@@ -492,7 +546,7 @@ async function checkLpPosition(poolName, tick, tickLower, tickUpper, key, rpc) {
 
 async function check() {
     console.log("\n--- Verification ---");
-    lastStatus = { updatedAt: new Date().toISOString(), lp: [], lending: [] };
+    lastStatus = { updatedAt: new Date().toISOString(), lp: [], lending: [], perps: [] };
 
     // Étape 1 : fetch positions en parallèle — via le cache 15 min (cf. positionsEnCache)
     const [velodromePositions, arcPositions, prjxPositions, satsumaPositions] = await Promise.all([
@@ -538,7 +592,8 @@ async function check() {
     }
 
     // Étape 4 : lending en parallèle
-    await Promise.all([checkSakeLending(), checkMorphoLending(), checkListaLending()]);
+    // Étape 4 : lending + perps en parallèle
+    await Promise.all([checkSakeLending(), checkMorphoLending(), checkListaLending(), checkHyperliquidPerps()]);
 }
 
 let isChecking = false;
