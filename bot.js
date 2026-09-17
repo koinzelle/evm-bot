@@ -28,6 +28,14 @@ const HYPERVM_RPC = "https://rpc.hyperliquid.xyz/evm";
 const SONEIUM_RPC = "https://rpc.soneium.org";
 const BSC_RPC     = "https://bsc-dataseed.binance.org/";
 const CITREA_RPC  = "https://rpc.mainnet.citrea.xyz";
+// (2026-09-17) Arc — chaîne 5042, gas natif en USDC. Aerodrome y déploie Slipstream, mais les
+// positions sont détenues par un wrapper « Slipstream V3 Deposit » (AERO-CL) et NON par le
+// NonfungiblePositionManager habituel : ce dernier existe bien à la même adresse que sur Soneium
+// (déploiement déterministe, 24 Ko de code) mais `positions(853)` y revert « ID ».
+// Le wrapper expose la MÊME signature `positions(uint256)` sur 12 mots, donc le décodage est
+// identique. Et comme il est ERC721Enumerable et que le wallet détient le NFT en direct (position
+// non stakée), on énumère en RPC pur : aucun explorateur, donc aucun 429 possible sur cette chaîne.
+const ARC_RPC     = "https://rpc.mainnet.arc.io";
 
 const SAKE_POOL           = "0x3C3987A310ee13F7B8cBBe21D97D4436ba5E4B5f";
 const LISTA_MOOLAH        = "0x8f73b65b4caaf64fba2af91cc5d4a2a1318e5d8c";
@@ -47,6 +55,8 @@ const SATSUMA_CBTC_CTUSD_POOL = "0x5d4b518984ae9778479ee2ea782b9925bbf17080";
 const VELODROME_NFPM      = "0x991d5546c4b442b4c5fdc4c8b8b8d131deb24702";
 const VELODROME_GAUGE     = "0x9659d8C3371bBEA56e083F4e497c0b5097519509";
 const VELODROME_POOL      = "0xc6b8e3559feb231d7769c12872ffbe95c3e20ff7";
+const ARC_DEPOSIT_NFT     = "0xc84bb45d43cd25d02b83b4c085eaa4e08da8f473"; // « Slipstream V3 Deposit » (AERO-CL)
+const ARC_POOL_WETH_CIRBTC = "0x72DfF32c9C5c28758565bE0a7d4E6E42FB498506"; // WETH/cirBTC 0,03 %, tickSpacing 10
 const HYPE_UBTC_POOL      = "0x0D6ECB912b6ee160e95Bc198b618Acc1bCb92525";
 const UPUMP_HYPE_POOL     = "0x78cc152a531dbde2f3fe7001ad659fa120fa893b";
 const KHYPE_UBTC_POOL     = "0x467364bd2a633208b4534f5b7ec11d24604546e4"; // PRJX 0.3% fee
@@ -58,6 +68,34 @@ const OOR_COOLDOWN        = 60 * 60 * 1000; // rappel hors range toutes les heur
 const CHECK_INTERVAL      = 60 * 1000;      // cycle toutes les 60s
 
 let alertedPositions = {};
+
+// ── (2026-09-17) CACHE DES LISTES DE POSITIONS ────────────────────────────────────────────────
+// Mesuré le 17/09 sur 24 cycles : 14 échouaient en 429 sur Blockscout Soneium (58 %), et un 429
+// faisait renvoyer une liste VIDE — la position #98322, HORS RANGE à ce moment-là, disparaissait
+// purement et simplement du suivi. L'alerte n'était pas perdue (l'état `alertedPositions` survit)
+// mais la surveillance avait un trou 58 % du temps.
+// Cause : la liste des NFT de position était re-téléchargée à CHAQUE cycle de 60 s, soit 1 440 fois
+// par jour, alors qu'elle ne change que lorsqu'on ouvre, ferme ou stake une position. Le tick, lui,
+// se lit en RPC direct sans quota et reste à chaque cycle.
+// Un lecteur qui ÉCHOUE doit renvoyer `null` (et non `[]`) pour que le cache puisse distinguer
+// « plus aucune position » de « je n'ai pas réussi à lire ».
+const POS_TTL_MS = 15 * 60 * 1000;
+const posCache = {};
+async function positionsEnCache(cle, lecteur) {
+    const c = posCache[cle];
+    if (c && Date.now() - c.ts < POS_TTL_MS) return c.positions;
+    const frais = await lecteur();
+    if (frais === null) {
+        if (c) {
+            console.log(`  ♻️ ${cle} : lecture échouée — on garde la liste connue (${c.positions.length} position(s), vue il y a ${Math.round((Date.now() - c.ts) / 60000)} min)`);
+            return c.positions;
+        }
+        console.log(`  ⚠️ ${cle} : lecture échouée et aucun cache — surveillance impossible ce cycle`);
+        return [];
+    }
+    posCache[cle] = { positions: frais, ts: Date.now() };
+    return frais;
+}
 // Telegram via axios direct (même approche que le bot Meteora)
 
 // ── Utilitaires ───────────────────────────────────────────────
@@ -165,7 +203,38 @@ async function getVelodromeActivePositions() {
         return positions;
     } catch (err) {
         console.log("Erreur positions Velodrome:", err.message);
-        return [];
+        return null;   // null = échec, le cache prend le relais (pas [] qui signifierait « aucune position »)
+    }
+}
+
+// ── Positions Aerodrome Slipstream (Arc) — RPC pur, sans explorateur ──────────
+// Le wallet détient les NFT en direct (non stakés) : ERC721Enumerable suffit.
+
+async function getArcActivePositions() {
+    try {
+        const bal = await rpcCall(ARC_RPC, ARC_DEPOSIT_NFT, "0x70a08231" + WALLET_NO_PREFIX);
+        const n = bal && bal !== "0x" ? parseInt(bal, 16) : 0;
+        const positions = [];
+        for (let i = 0; i < n; i++) {
+            const idHex = await rpcCall(ARC_RPC, ARC_DEPOSIT_NFT,
+                "0x2f745c59" + WALLET_NO_PREFIX + i.toString(16).padStart(64, "0"));   // tokenOfOwnerByIndex
+            if (!idHex || idHex === "0x") continue;
+            const tokenId = BigInt(idHex);
+            const posData = await rpcCall(ARC_RPC, ARC_DEPOSIT_NFT,
+                "0x99fbab88" + tokenId.toString(16).padStart(64, "0"));                // positions(uint256)
+            if (!posData || posData === "0x") continue;
+            const data = posData.slice(2);
+            const tickLower = decodeTick(data.slice(320, 384));
+            const tickUpper = decodeTick(data.slice(384, 448));
+            const liquidity = BigInt("0x" + data.slice(448, 512));
+            if (liquidity === 0n) continue;
+            positions.push({ tokenId: tokenId.toString(), tickLower, tickUpper,
+                poolName: "Aerodrome WETH/cirBTC", pool: ARC_POOL_WETH_CIRBTC });
+        }
+        return positions;
+    } catch (err) {
+        console.log("Erreur positions Arc:", err.message);
+        return null;
     }
 }
 
@@ -213,7 +282,7 @@ async function getPrjxActivePositions() {
         return positions;
     } catch (err) {
         console.log("Erreur positions PRJX:", err.message);
-        return [];
+        return null;   // null = échec, le cache prend le relais
     }
 }
 
@@ -254,7 +323,7 @@ async function getSatsumaActivePositions() {
         return positions;
     } catch (err) {
         console.log("Erreur positions Satsuma:", err.message);
-        return [];
+        return null;   // null = échec, le cache prend le relais (pas [] qui signifierait « aucune position »)
     }
 }
 
@@ -425,15 +494,17 @@ async function check() {
     console.log("\n--- Verification ---");
     lastStatus = { updatedAt: new Date().toISOString(), lp: [], lending: [] };
 
-    // Étape 1 : fetch positions en parallèle
-    const [velodromePositions, prjxPositions, satsumaPositions] = await Promise.all([
-        getVelodromeActivePositions(),
-        getPrjxActivePositions(),
-        getSatsumaActivePositions(),
+    // Étape 1 : fetch positions en parallèle — via le cache 15 min (cf. positionsEnCache)
+    const [velodromePositions, arcPositions, prjxPositions, satsumaPositions] = await Promise.all([
+        positionsEnCache("Velodrome/Soneium", getVelodromeActivePositions),
+        positionsEnCache("Aerodrome/Arc",     getArcActivePositions),
+        positionsEnCache("PRJX/Hyperliquid",  getPrjxActivePositions),
+        positionsEnCache("Satsuma/Citrea",    getSatsumaActivePositions),
     ]);
 
     // Étape 2 : fetch ticks LP + lending en parallèle
     const veloTick = velodromePositions.length > 0 ? await getPoolTick(SONEIUM_RPC, VELODROME_POOL) : null;
+    const arcTick  = arcPositions.length > 0 ? await getPoolTick(ARC_RPC, ARC_POOL_WETH_CIRBTC) : null;
     const prjxTickPromises = prjxPositions.map(pos => getPoolTick(HYPERVM_RPC, pos.pool));
     const satsumaTickPromises = satsumaPositions.map(pos => getAlgebraPoolTick(CITREA_RPC, pos.pool));
 
@@ -447,6 +518,11 @@ async function check() {
     for (const pos of velodromePositions) {
         console.log("Velodrome WBTC/WETH #" + pos.tokenId + " | Tick: " + veloTick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (veloTick !== null ? (veloTick >= pos.tickLower && veloTick <= pos.tickUpper ? "IN RANGE" : "⚠️ OUT OF RANGE") : "❌ RPC KO"));
         await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Soneium)", veloTick, pos.tickLower, pos.tickUpper, "velodrome_" + pos.tokenId);
+    }
+
+    console.log("Arc: " + arcPositions.length + " positions actives");
+    for (const pos of arcPositions) {
+        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Arc)", arcTick, pos.tickLower, pos.tickUpper, "arc_" + pos.tokenId);
     }
 
     console.log("PRJX: " + prjxPositions.length + " positions actives");
