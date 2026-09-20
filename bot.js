@@ -375,8 +375,11 @@ async function checkSakeLending() {
 async function checkMorphoLending() {
     try {
         const wallet = WALLET;
-        // Base (8453) + Katana (747474) — chainId multiple pour ne pas être aveugle si les positions bougent de chaîne
-        const query = `{ marketPositions(where: { userAddress_in: ["${wallet}"], chainId_in: [8453, 747474] }) { items { market { marketId lltv chain { network } collateralAsset { symbol } loanAsset { symbol } } state { collateralUsd borrowAssetsUsd } } } }`;
+        // Base (8453) + Katana (747474) + Arc (5042) — chainId multiple pour ne pas être aveugle si les
+        // positions bougent de chaîne. (2026-09-21) Arc ajouté : le user a déplacé ses fonds de Monad
+        // vers Arc pour prêter sur Morpho. Vérifié avant de coder — l'API Morpho indexe bien 5042 et
+        // renvoie le marché cirBTC/USDC (LLTV 86 %), HF calculé 1,6722 par la formule existante.
+        const query = `{ marketPositions(where: { userAddress_in: ["${wallet}"], chainId_in: [8453, 747474, 5042] }) { items { market { marketId lltv chain { network } collateralAsset { symbol } loanAsset { symbol } } state { collateralUsd borrowAssetsUsd } } } }`;
         const res = await axios.post("https://blue-api.morpho.org/graphql", { query }, { timeout: 10000 });
         const items = res.data?.data?.marketPositions?.items || [];
         for (const pos of items) {
