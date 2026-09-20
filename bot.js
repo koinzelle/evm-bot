@@ -5,11 +5,49 @@ const http = require("http");
 
 // ── Capture des logs pour /logs (sur Railway console.log part dans le flux Railway, pas de fichier) ──
 const LOG_BUFFER = [];
+// ── (2026-09-21) PERSISTANCE DES LOGS PAR JOUR — repris du bonus-bot ──────────────────────────────
+// Avant : buffer mémoire de 3000 lignes + un `bot.log` dans __dirname, tous deux perdus à chaque
+// redéploiement. Impossible de revenir sur un épisode de la veille (HF qui a plongé, LP sortie de
+// range la nuit). On flushe donc en batch dans des fichiers journaliers.
+// ⚠️ `DATA_DIR` doit pointer sur un VOLUME Railway, sinon les fichiers restent éphémères et ce
+// changement n'apporte rien : le démarrage le dit explicitement.
+const LOG_DISK_QUEUE = [];
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+try { if (DATA_DIR !== __dirname) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+const LOG_DIR = path.join(DATA_DIR, "logs");
+try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (_) {}
+const LOG_RETENTION_DAYS = parseInt(process.env.LOG_RETENTION_DAYS || "365", 10);
+const LOG_MAX_BYTES = parseInt(process.env.LOG_MAX_BYTES || String(512 * 1024 * 1024), 10);
+const LOG_DAY_RE = /^\d{4}-\d{2}-\d{2}\.txt$/;
+function flushLogsToDisk() {
+    if (!LOG_DISK_QUEUE.length) return;
+    const chunk = LOG_DISK_QUEUE.splice(0, LOG_DISK_QUEUE.length);
+    const day = new Date().toISOString().slice(0, 10);
+    try { fs.appendFileSync(path.join(LOG_DIR, `${day}.txt`), chunk.join("\n") + "\n"); }
+    catch (e) { _origLog("⚠️ flushLogs:", e.message); }
+}
+function rotateLogs() {
+    try {
+        const cutoff = Date.now() - LOG_RETENTION_DAYS * 86400e3;
+        for (const f of fs.readdirSync(LOG_DIR).filter(x => LOG_DAY_RE.test(x))) {
+            const d = Date.parse(f.slice(0, 10));
+            if (!isNaN(d) && d < cutoff) { try { fs.unlinkSync(path.join(LOG_DIR, f)); } catch (_) {} }
+        }
+        let rest = fs.readdirSync(LOG_DIR).filter(x => LOG_DAY_RE.test(x)).sort();
+        let total = rest.reduce((a, f) => { try { return a + fs.statSync(path.join(LOG_DIR, f)).size; } catch (_) { return a; } }, 0);
+        while (total > LOG_MAX_BYTES && rest.length > 1) {
+            const oldest = rest.shift();
+            try { total -= fs.statSync(path.join(LOG_DIR, oldest)).size; fs.unlinkSync(path.join(LOG_DIR, oldest)); } catch (_) {}
+        }
+    } catch (_) {}
+}
 const _origLog = console.log.bind(console), _origErr = console.error.bind(console);
 function _cap(fn, args) {
     try {
-        LOG_BUFFER.push(`[${new Date().toISOString()}] ` + args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" "));
+        const ligne = `[${new Date().toISOString()}] ` + args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
+        LOG_BUFFER.push(ligne);
         if (LOG_BUFFER.length > 3000) LOG_BUFFER.shift();
+        LOG_DISK_QUEUE.push(ligne);
     } catch (_) {}
     fn(...args);
 }
@@ -205,6 +243,69 @@ async function getVelodromeActivePositions() {
         console.log("Erreur positions Velodrome:", err.message);
         return null;   // null = échec, le cache prend le relais (pas [] qui signifierait « aucune position »)
     }
+}
+
+// ── Positions Raydium CLMM (Solana) — RPC pur, sans SDK ni Helius ────────────
+// (2026-09-21) Wallet SÉPARÉ de celui des chaînes EVM. Vérifié avant d'écrire : le wallet détient
+// 1 position, pool KOx/USDC (7HNwUP5r…), range [-2040, 0], tick -992, tickSpacing 120.
+// Volontairement SANS `@solana/web3.js` : la seule chose qu'il apporterait ici est la dérivation de
+// PDA, qui exige une vérification de point ed25519. On l'évite avec un `getProgramAccounts` filtré
+// sur le mint du NFT (offset 9 de PersonalPositionState) — le mint sort déjà en base58 de
+// `getTokenAccountsByOwner`, donc aucun encodage à faire côté seeds.
+// NE PAS réutiliser la clé Helius du bonus-bot : son quota tombe régulièrement. Un endpoint public
+// suffit — 2 à 3 appels par cycle de 60 s.
+const SOL_RPC    = process.env.SOL_RPC || "https://api.mainnet-beta.solana.com";
+const SOL_WALLET = process.env.SOL_WALLET || "hwJUhBUApRoxCFgjWESbrZgC8Rh9SdPsNfEr8RTLgMV";
+const RAY_CLMM   = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const SPL_TOKEN  = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const SPL_T22    = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const B58_ALPHA  = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function b58encode(buf) {
+    let n = 0n; for (const b of buf) n = n * 256n + BigInt(b);
+    let out = ""; while (n > 0n) { out = B58_ALPHA[Number(n % 58n)] + out; n /= 58n; }
+    for (const b of buf) { if (b === 0) out = "1" + out; else break; }
+    return out || "1";
+}
+async function solRpc(method, params) {
+    const r = await axios.post(SOL_RPC, { jsonrpc: "2.0", id: 1, method, params }, { timeout: 15000 });
+    if (r.data.error) throw new Error(r.data.error.message);
+    return r.data.result;
+}
+// Décodage PersonalPositionState : 8 discriminant + 1 bump + 32 nft_mint + 32 pool_id
+// → pool_id à 41, tick_lower (i32) à 73, tick_upper à 77, liquidity (u128) à 81.
+async function getRaydiumPositions() {
+    try {
+        const mints = [];
+        for (const prog of [SPL_TOKEN, SPL_T22]) {
+            const r = await solRpc("getTokenAccountsByOwner", [SOL_WALLET, { programId: prog }, { encoding: "jsonParsed" }]);
+            for (const { account } of (r.value || [])) {
+                const i = account.data.parsed.info;
+                if (i.tokenAmount.amount === "1" && i.tokenAmount.decimals === 0) mints.push(i.mint);
+            }
+        }
+        const out = [];
+        for (const mint of mints) {
+            const r = await solRpc("getProgramAccounts", [RAY_CLMM, {
+                encoding: "base64", filters: [{ memcmp: { offset: 9, bytes: mint } }] }]);
+            for (const acc of (r || [])) {
+                const d = Buffer.from(acc.account.data[0], "base64");
+                const liq = d.readBigUInt64LE(81) + (d.readBigUInt64LE(89) << 64n);
+                if (liq === 0n) continue;                                  // position vidée → on ne suit plus
+                out.push({ tokenId: mint.slice(0, 6), poolId: b58encode(d.subarray(41, 73)),
+                    tickLower: d.readInt32LE(73), tickUpper: d.readInt32LE(77), poolName: "Raydium CLMM" });
+            }
+        }
+        return out;
+    } catch (err) { console.log("Erreur positions Raydium:", err.message); return []; }
+}
+// PoolState : tick_current (i32) à l'offset 269 (8+1+32×7 = 233, decimals 233/234, tickSpacing 235,
+// liquidity u128 à 237, sqrt_price_x64 à 253).
+async function getRaydiumPoolTick(poolId) {
+    try {
+        const r = await solRpc("getAccountInfo", [poolId, { encoding: "base64" }]);
+        if (!r || !r.value) return null;
+        return Buffer.from(r.value.data[0], "base64").readInt32LE(269);
+    } catch (err) { console.log("Erreur tick Raydium:", err.message); return null; }
 }
 
 // ── Positions Aerodrome Slipstream (Arc) — RPC pur, sans explorateur ──────────
@@ -552,11 +653,12 @@ async function check() {
     lastStatus = { updatedAt: new Date().toISOString(), lp: [], lending: [], perps: [] };
 
     // Étape 1 : fetch positions en parallèle — via le cache 15 min (cf. positionsEnCache)
-    const [velodromePositions, arcPositions, prjxPositions, satsumaPositions] = await Promise.all([
+    const [velodromePositions, arcPositions, prjxPositions, satsumaPositions, raydiumPositions] = await Promise.all([
         positionsEnCache("Velodrome/Soneium", getVelodromeActivePositions),
         positionsEnCache("Aerodrome/Arc",     getArcActivePositions),
         positionsEnCache("PRJX/Hyperliquid",  getPrjxActivePositions),
         positionsEnCache("Satsuma/Citrea",    getSatsumaActivePositions),
+        positionsEnCache("Raydium/Solana",    getRaydiumPositions),
     ]);
 
     // Étape 2 : fetch ticks LP + lending en parallèle
@@ -580,6 +682,12 @@ async function check() {
     console.log("Arc: " + arcPositions.length + " positions actives");
     for (const pos of arcPositions) {
         await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Arc)", arcTick, pos.tickLower, pos.tickUpper, "arc_" + pos.tokenId);
+    }
+
+    console.log("Raydium: " + raydiumPositions.length + " positions actives");
+    for (const pos of raydiumPositions) {
+        const tick = await getRaydiumPoolTick(pos.poolId);
+        await checkLpPosition(pos.poolName + " " + pos.poolId.slice(0, 6) + "… (Solana)", tick, pos.tickLower, pos.tickUpper, "raydium_" + pos.tokenId);
     }
 
     console.log("PRJX: " + prjxPositions.length + " positions actives");
@@ -606,6 +714,10 @@ async function safeCheck() {
     try { await check(); } finally { isChecking = false; }
 }
 console.log("🤖 EVM Bot démarré");
+console.log("🗄️ Logs: " + (DATA_DIR !== __dirname ? "persistés " + LOG_RETENTION_DAYS + "j dans " + LOG_DIR : "ÉPHÉMÈRES ⚠️ (DATA_DIR non défini — monter un volume Railway, sinon tout est perdu au redéploiement)"));
+setInterval(flushLogsToDisk, 20 * 1000);
+setInterval(rotateLogs, 6 * 3600e3);
+rotateLogs();
 console.log("📱 Telegram token longueur:", TELEGRAM_TOKEN.length, "| CHAT_ID:", CHAT_ID);
 setInterval(safeCheck, CHECK_INTERVAL);
 safeCheck();
@@ -615,7 +727,31 @@ safeCheck();
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     const url = (req.url || "/").split("?")[0];
-    if (url === "/logs") {
+    if (url === "/logs/list") {
+        flushLogsToDisk();
+        let info = [];
+        try {
+            info = fs.readdirSync(LOG_DIR).filter(f => LOG_DAY_RE.test(f)).sort().map(f => {
+                let sz = 0; try { sz = fs.statSync(path.join(LOG_DIR, f)).size; } catch (_) {}
+                return { date: f.slice(0, 10), sizeKB: Math.round(sz / 1024) };
+            });
+        } catch (_) {}
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ retentionDays: LOG_RETENTION_DAYS, persistant: DATA_DIR !== __dirname, days: info }));
+    } else if (url === "/logs/file") {
+        flushLogsToDisk();
+        const q = new URL(req.url, "http://x").searchParams;
+        const from = q.get("from") || q.get("date"), to = q.get("to") || q.get("date");
+        let out = [];
+        try {
+            for (const f of fs.readdirSync(LOG_DIR).filter(f => LOG_DAY_RE.test(f)).sort()) {
+                const d = f.slice(0, 10);
+                if ((!from || d >= from) && (!to || d <= to)) out.push(fs.readFileSync(path.join(LOG_DIR, f), "utf8"));
+            }
+        } catch (_) {}
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(out.join(""));
+    } else if (url === "/logs") {
         const tail = parseInt(new URL(req.url, "http://x").searchParams.get("tail") || "300", 10);
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
         res.end(LOG_BUFFER.slice(-tail).join("\n"));
@@ -624,7 +760,7 @@ http.createServer((req, res) => {
         res.end(JSON.stringify(lastStatus, null, 2));
     } else {
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-        res.end("EVM alert bot OK\nEndpoints: /status  /logs?tail=N");
+        res.end("EVM alert bot OK\nEndpoints: /status  /logs?tail=N  /logs/list  /logs/file?date=YYYY-MM-DD");
     }
 }).listen(PORT, () => console.log("🌐 HTTP server on port " + PORT));
 
