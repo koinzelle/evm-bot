@@ -74,6 +74,17 @@ const CITREA_RPC  = "https://rpc.mainnet.citrea.xyz";
 // identique. Et comme il est ERC721Enumerable et que le wallet détient le NFT en direct (position
 // non stakée), on énumère en RPC pur : aucun explorateur, donc aucun 429 possible sur cette chaîne.
 const ARC_RPC     = "https://rpc.mainnet.arc.io";
+// (2026-10-12) Ink — chaîne 57073 (L2 de Kraken, OP Stack). Velodrome y déploie Slipstream avec le MÊME
+// NonfungiblePositionManager que sur Soneium (`VELODROME_NFPM`, déploiement déterministe Superchain,
+// « Slipstream Position NFT v1.2 »). Comme sur Soneium la position est STAKÉE : le NFT appartient au
+// gauge, donc `balanceOf(wallet)` vaut 0. On retrouve les tokenIds par les transferts NFT du wallet
+// (Blockscout Ink, via le cache 15 min), puis le propriétaire ACTUEL en RPC (`ownerOf`) : le wallet
+// (non stakée) ou un contrat auquel le wallet l'a confiée (gauge). La pool vient de la factory
+// (`getPool(token0, token1, tickSpacing)`), ce qui couvre aussi une future position non stakée.
+// Vérifié avant d'écrire : #1765893 dans le gauge 0xfa6d57ef…, pool WETH/kBTC 0xedafd349… (tickSpacing
+// 100), range [-265400, -265000], tick -265193 ; factory 0x04625b04… renvoie bien cette pool.
+const INK_RPC          = "https://rpc-gel.inkonchain.com";
+const INK_EXPLORER_API = "https://explorer.inkonchain.com/api";
 
 const SAKE_POOL           = "0x3C3987A310ee13F7B8cBBe21D97D4436ba5E4B5f";
 const LISTA_MOOLAH        = "0x8f73b65b4caaf64fba2af91cc5d4a2a1318e5d8c";
@@ -242,6 +253,66 @@ async function getVelodromeActivePositions() {
     } catch (err) {
         console.log("Erreur positions Velodrome:", err.message);
         return null;   // null = échec, le cache prend le relais (pas [] qui signifierait « aucune position »)
+    }
+}
+
+// ── Positions Velodrome (Ink) — Blockscout Ink pour les tokenIds, RPC pour tout le reste ──────
+
+const _symboles = new Map();
+async function symboleToken(rpc, adresse) {
+    const cle = rpc + adresse;
+    if (_symboles.has(cle)) return _symboles.get(cle);
+    let s = adresse.slice(0, 6);
+    try {
+        const r = await rpcCall(rpc, adresse, "0x95d89b41");   // symbol()
+        if (r && r.length > 130) s = Buffer.from(r.slice(130), "hex").toString("utf8").replace(/\0/g, "").trim() || s;
+    } catch (_) { /* on garde le préfixe d'adresse */ }
+    _symboles.set(cle, s);
+    return s;
+}
+
+async function getInkVelodromePositions() {
+    try {
+        const res = await axios.get(INK_EXPLORER_API, {
+            params: { module: "account", action: "tokennfttx", contractaddress: VELODROME_NFPM, address: WALLET, page: 1, offset: 100 },
+            timeout: 10000,
+        });
+        const txs = res.data?.result;
+        if (!Array.isArray(txs)) return null;   // réponse inattendue (429, page d'erreur) → le cache prend le relais
+        const ids = [...new Set(txs.map(tx => tx.tokenID).filter(Boolean))];
+        const factoryHex = await rpcCall(INK_RPC, VELODROME_NFPM, "0xc45a0155");   // factory()
+        const factory = factoryHex && factoryHex !== "0x" ? "0x" + factoryHex.slice(-40) : null;
+        const positions = [];
+        for (const id of ids) {
+            const idHex = BigInt(id).toString(16).padStart(64, "0");
+            const owner = await rpcCall(INK_RPC, VELODROME_NFPM, "0x6352211e" + idHex);   // ownerOf (revert si brûlé)
+            if (!owner || owner === "0x") continue;                                     // position fermée
+            const ownerAddr = "0x" + owner.slice(-40).toLowerCase();
+            const confieParWallet = txs.some(tx => tx.tokenID === id
+                && tx.from?.toLowerCase() === WALLET && tx.to?.toLowerCase() === ownerAddr);
+            if (ownerAddr !== WALLET && !confieParWallet) continue;                      // cédée à quelqu'un d'autre
+            const posData = await rpcCall(INK_RPC, VELODROME_NFPM, "0x99fbab88" + idHex);   // positions(uint256)
+            if (!posData || posData === "0x") continue;
+            const data = posData.slice(2);
+            const token0 = "0x" + data.slice(128 + 24, 192), token1 = "0x" + data.slice(192 + 24, 256);
+            const tickSpacingHex = data.slice(256, 320);
+            const tickLower = decodeTick(data.slice(320, 384)), tickUpper = decodeTick(data.slice(384, 448));
+            const liquidity = BigInt("0x" + data.slice(448, 512));
+            if (liquidity === 0n) continue;
+            let pool = null;
+            if (factory) {
+                const p = await rpcCall(INK_RPC, factory, "0x28af8d0b"                    // getPool(address,address,int24)
+                    + token0.slice(2).padStart(64, "0") + token1.slice(2).padStart(64, "0") + tickSpacingHex);
+                if (p && p !== "0x" && !/^0x0+$/.test(p)) pool = "0x" + p.slice(-40);
+            }
+            if (!pool) { console.log(`  ⚠️ Velodrome/Ink #${id} : pool introuvable`); continue; }
+            const nom = `${await symboleToken(INK_RPC, token0)}/${await symboleToken(INK_RPC, token1)}`;
+            positions.push({ tokenId: id, tickLower, tickUpper, pool, poolName: "Velodrome " + nom, stakee: ownerAddr !== WALLET });
+        }
+        return positions;
+    } catch (err) {
+        console.log("Erreur positions Velodrome Ink:", err.message);
+        return null;
     }
 }
 
@@ -653,12 +724,13 @@ async function check() {
     lastStatus = { updatedAt: new Date().toISOString(), lp: [], lending: [], perps: [] };
 
     // Étape 1 : fetch positions en parallèle — via le cache 15 min (cf. positionsEnCache)
-    const [velodromePositions, arcPositions, prjxPositions, satsumaPositions, raydiumPositions] = await Promise.all([
+    const [velodromePositions, arcPositions, prjxPositions, satsumaPositions, raydiumPositions, inkPositions] = await Promise.all([
         positionsEnCache("Velodrome/Soneium", getVelodromeActivePositions),
         positionsEnCache("Aerodrome/Arc",     getArcActivePositions),
         positionsEnCache("PRJX/Hyperliquid",  getPrjxActivePositions),
         positionsEnCache("Satsuma/Citrea",    getSatsumaActivePositions),
         positionsEnCache("Raydium/Solana",    getRaydiumPositions),
+        positionsEnCache("Velodrome/Ink",     getInkVelodromePositions),
     ]);
 
     // Étape 2 : fetch ticks LP + lending en parallèle
@@ -677,6 +749,13 @@ async function check() {
     for (const pos of velodromePositions) {
         console.log("Velodrome WBTC/WETH #" + pos.tokenId + " | Tick: " + veloTick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (veloTick !== null ? (veloTick >= pos.tickLower && veloTick <= pos.tickUpper ? "IN RANGE" : "⚠️ OUT OF RANGE") : "❌ RPC KO"));
         await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Soneium)", veloTick, pos.tickLower, pos.tickUpper, "velodrome_" + pos.tokenId);
+    }
+
+    console.log("Velodrome Ink: " + inkPositions.length + " positions actives");
+    for (const pos of inkPositions) {
+        const tick = await getPoolTick(INK_RPC, pos.pool);
+        console.log(pos.poolName + " #" + pos.tokenId + " (Ink" + (pos.stakee ? ", stakée" : "") + ") | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (tick !== null ? (tick >= pos.tickLower && tick <= pos.tickUpper ? "IN RANGE" : "⚠️ OUT OF RANGE") : "❌ RPC KO"));
+        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Ink)", tick, pos.tickLower, pos.tickUpper, "ink_" + pos.tokenId);
     }
 
     console.log("Arc: " + arcPositions.length + " positions actives");
