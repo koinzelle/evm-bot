@@ -116,7 +116,17 @@ const KHYPE = "fd739d4e423301ce9385c1fb8850539d657c296d"; // Kinetiq Staked HYPE
 const OOR_COOLDOWN        = 60 * 60 * 1000; // rappel hors range toutes les heures
 const CHECK_INTERVAL      = 60 * 1000;      // cycle toutes les 60s
 
+// (2026-10-15) L'état des alertes survit aux redéploiements (volume Railway) : avant, chaque redémarrage
+// renvoyait les alertes « proche de la borne » de positions déjà signalées (3 alertes reçues le 15/10).
+const ALERTES_FICHIER = path.join(DATA_DIR, "alertes-etat.json");
 let alertedPositions = {};
+try { alertedPositions = JSON.parse(fs.readFileSync(ALERTES_FICHIER, "utf8")) || {}; } catch (_) { /* premier démarrage */ }
+let _etatAlertesEcrit = JSON.stringify(alertedPositions);
+function sauverEtatAlertes() {
+    const etat = JSON.stringify(alertedPositions);
+    if (etat === _etatAlertesEcrit) return;
+    try { fs.writeFileSync(ALERTES_FICHIER, etat); _etatAlertesEcrit = etat; } catch (_) { /* volume absent : état en mémoire seulement */ }
+}
 
 // ── (2026-09-17) CACHE DES LISTES DE POSITIONS ────────────────────────────────────────────────
 // Mesuré le 17/09 sur 24 cycles : 14 échouaient en 429 sur Blockscout Soneium (58 %), et un 429
@@ -247,7 +257,8 @@ async function getVelodromeActivePositions() {
             const tickUpper  = decodeTick(data.slice(384, 448));
             const liquidity  = BigInt("0x" + data.slice(448, 512));
             if (liquidity === 0n) continue;
-            positions.push({ tokenId, tickLower, tickUpper, poolName: "Velodrome WBTC/WETH", pool: VELODROME_POOL });
+            positions.push({ tokenId, tickLower, tickUpper, poolName: "Velodrome WBTC/WETH", pool: VELODROME_POOL,
+                token0: "0x" + data.slice(128 + 24, 192), token1: "0x" + data.slice(192 + 24, 256) });
         }
         return positions;
     } catch (err) {
@@ -307,7 +318,7 @@ async function getInkVelodromePositions() {
             }
             if (!pool) { console.log(`  ⚠️ Velodrome/Ink #${id} : pool introuvable`); continue; }
             const nom = `${await symboleToken(INK_RPC, token0)}/${await symboleToken(INK_RPC, token1)}`;
-            positions.push({ tokenId: id, tickLower, tickUpper, pool, poolName: "Velodrome " + nom, stakee: ownerAddr !== WALLET });
+            positions.push({ tokenId: id, tickLower, tickUpper, pool, poolName: "Velodrome " + nom, stakee: ownerAddr !== WALLET, token0, token1 });
         }
         return positions;
     } catch (err) {
@@ -401,7 +412,8 @@ async function getArcActivePositions() {
             const liquidity = BigInt("0x" + data.slice(448, 512));
             if (liquidity === 0n) continue;
             positions.push({ tokenId: tokenId.toString(), tickLower, tickUpper,
-                poolName: "Aerodrome WETH/cirBTC", pool: ARC_POOL_WETH_CIRBTC });
+                poolName: "Aerodrome WETH/cirBTC", pool: ARC_POOL_WETH_CIRBTC,
+                token0: "0x" + data.slice(128 + 24, 192), token1: "0x" + data.slice(192 + 24, 256) });
         }
         return positions;
     } catch (err) {
@@ -448,6 +460,7 @@ async function getPrjxActivePositions() {
                 tickUpper: decodeTick(data.slice(384, 448)),
                 poolName,
                 pool,
+                token0: "0x" + token0, token1: "0x" + token1,
             });
         }
         if (skipped > 0) console.log("  (" + skipped + " NFTs inactifs ignorés)");
@@ -489,7 +502,8 @@ async function getSatsumaActivePositions() {
             }
             if (liquidity === 0n) { emptyStreak++; skipped++; continue; }
             emptyStreak = 0;
-            positions.push({ tokenId, tickLower, tickUpper, poolName: "Satsuma cBTC/ctUSD", pool: SATSUMA_CBTC_CTUSD_POOL });
+            positions.push({ tokenId, tickLower, tickUpper, poolName: "Satsuma cBTC/ctUSD", pool: SATSUMA_CBTC_CTUSD_POOL,
+                token0: "0x" + data.slice(128 + 24, 192), token1: "0x" + data.slice(192 + 24, 256) });
         }
         if (skipped > 0) console.log("  (" + skipped + " NFTs Satsuma inactifs ignorés)");
         return positions;
@@ -666,36 +680,97 @@ async function checkHyperliquidPerps() {
     }
 }
 
-async function checkNearSide(poolName, tick, bound, boundLabel, pctLeft, ticksLeft, trendMsg, key) {
+// ── (2026-10-15, demande user) ALERTES LISIBLES ─────────────────────────────────────────────────
+// Avant : des ticks (« Tick 178043 / Borne 177720 ») et, pour Raydium, le seul début de l'adresse de la
+// pool (« Raydium CLMM 7HNwUP… ») — le user ne savait pas de quelle position il s'agissait. Maintenant :
+// le nom de la paire et des PRIX (prix actuel, borne, écart en %). Seuils, paliers et rappels inchangés.
+const STABLES_ALERTE = new Set(["USDC", "USDT", "USDT0", "USD₮0", "USDE", "CTUSD", "LISUSD", "USD1", "DAI"]);
+const _paires = new Map();
+async function paireEvm(rpc, token0, token1) {
+    if (!rpc || !token0 || !token1) return null;
+    const cle = rpc + token0 + token1;
+    if (_paires.has(cle)) return _paires.get(cle);
+    try {
+        const d0 = parseInt(await rpcCall(rpc, token0, "0x313ce567"), 16);   // decimals()
+        const d1 = parseInt(await rpcCall(rpc, token1, "0x313ce567"), 16);
+        if (isNaN(d0) || isNaN(d1)) return null;
+        const v = { sym0: await symboleToken(rpc, token0), sym1: await symboleToken(rpc, token1), dec0: d0, dec1: d1 };
+        _paires.set(cle, v);
+        return v;
+    } catch (_) { return null; }   // pas de prix : l'alerte retombe sur l'ancien format en ticks
+}
+// PoolState Raydium : mint 0 à l'offset 73, mint 1 à 105, décimales à 233/234 ; symboles via DexScreener
+async function paireRaydium(poolId) {
+    if (_paires.has(poolId)) return _paires.get(poolId);
+    try {
+        const r = await solRpc("getAccountInfo", [poolId, { encoding: "base64" }]);
+        const d = Buffer.from(r.value.data[0], "base64");
+        const m0 = b58encode(d.subarray(73, 105)), m1 = b58encode(d.subarray(105, 137));
+        const ds = (await axios.get("https://api.dexscreener.com/tokens/v1/solana/" + m0 + "," + m1, { timeout: 10000 })).data || [];
+        const sym = m => ds.find(x => x.baseToken?.address === m)?.baseToken?.symbol
+            || ds.find(x => x.quoteToken?.address === m)?.quoteToken?.symbol || m.slice(0, 4);
+        const v = { sym0: sym(m0), sym1: sym(m1), dec0: d[233], dec1: d[234] };
+        _paires.set(poolId, v);
+        return v;
+    } catch (_) { return null; }
+}
+const prixTick = (tick, px) => Math.pow(1.0001, tick) * Math.pow(10, px.dec0 - px.dec1);
+function fmtPrix(x) {                     // 3 chiffres significatifs : 0,0000539 · 0,0292 · 96,3 · 2 430
+    if (!(x > 0) || !isFinite(x)) return "?";
+    const d = Math.min(12, Math.max(0, 2 - Math.floor(Math.log10(x))));
+    return x.toFixed(d).replace(".", ",");
+}
+const fr1 = x => Math.abs(x).toFixed(1).replace(".", ",");
+// prix « naturel » : jeton 0 en jeton 1, sauf pool stable/X → X en stable (les côtés s'inversent alors)
+function vueFourchette(px, tick, tickLower, tickUpper) {
+    const inv = STABLES_ALERTE.has(String(px.sym0).toUpperCase()) && !STABLES_ALERTE.has(String(px.sym1).toUpperCase());
+    const f = t => inv ? 1 / prixTick(t, px) : prixTick(t, px);
+    return { inv, prix: f(tick), bas: inv ? f(tickUpper) : f(tickLower), haut: inv ? f(tickLower) : f(tickUpper), unite: inv ? px.sym0 : px.sym1 };
+}
+
+async function checkNearSide(poolName, tick, bound, boundLabel, pctLeft, ticksLeft, trendMsg, key, texte) {
     const now = Date.now();
     const st = alertedPositions[key];
     if (pctLeft > NEAR_LEVELS[0]) { if (st) delete alertedPositions[key]; return; }
     const level = Math.min(...NEAR_LEVELS.filter(L => pctLeft <= L)); // palier le plus profond atteint
     if (!st || typeof st !== "object" || level < st.level) {
         // nouveau palier franchi → notif immédiate
-        const ok = await sendAlert(`⚠️ PROCHE ${boundLabel} (palier ${level}%) — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
+        const ok = await sendAlert(texte ? texte(false, pctLeft)
+            : `⚠️ PROCHE ${boundLabel} (palier ${level}%) — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
         if (ok) alertedPositions[key] = { level, lastAt: now };
     } else if (now - st.lastAt > NEAR_REMINDER_MS) {
         // toujours dans une zone d'alerte (n'importe quel palier 20/15/10/5) depuis > 1h → rappel horaire
         // avec l'état actuel. AVANT : ne rappelait qu'au palier 5% → une position collée à 8-12% restait
         // muette après la 1re alerte (bug : LP kHYPE/uBTC à 8.9% jamais rappelée).
-        const ok = await sendAlert(`⏰ RAPPEL (palier ${st.level}%) — ${poolName} toujours proche ${boundLabel.toLowerCase()}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
+        const ok = await sendAlert(texte ? texte(true, pctLeft)
+            : `⏰ RAPPEL (palier ${st.level}%) — ${poolName} toujours proche ${boundLabel.toLowerCase()}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
         if (ok) st.lastAt = now;
     }
 }
 
-async function checkNearRange(poolName, tick, tickLower, tickUpper, key) {
+async function checkNearRange(poolName, tick, tickLower, tickUpper, key, px) {
     if (tick < tickLower || tick > tickUpper) return;
     const rangeWidth = tickUpper - tickLower;
     const pctToLower = (tick - tickLower) / rangeWidth * 100;
     const pctToUpper = (tickUpper - tick)  / rangeWidth * 100;
-    await checkNearSide(poolName, tick, tickLower, "BORNE BASSE", pctToLower, tick - tickLower, "Le prix baisse — surveille ta position !", key + "_near_lower");
-    await checkNearSide(poolName, tick, tickUpper, "BORNE HAUTE", pctToUpper, tickUpper - tick, "Le prix monte — surveille ta position !", key + "_near_upper");
+    // texte en prix si la paire est connue ; « bas »/« haut » côté ticks, le côté AFFICHÉ suit le prix montré
+    const texte = coteTick => {
+        if (!px) return null;
+        const v = vueFourchette(px, tick, tickLower, tickUpper);
+        const cote = (coteTick === "bas") !== v.inv ? "BAS" : "HAUT";
+        const borne = cote === "BAS" ? v.bas : v.haut;
+        return (rappel, pct) => `${rappel ? `⏰ RAPPEL — ${poolName} toujours proche du ${cote}` : `⚠️ Proche du ${cote} — ${poolName}`}\n\n`
+            + `Prix : ${fmtPrix(v.prix)} ${v.unite}\n`
+            + `${cote === "BAS" ? "Bas" : "Haut"} de la fourchette : ${fmtPrix(borne)} (${borne < v.prix ? "−" : "+"}${fr1((borne / v.prix - 1) * 100)} %)\n`
+            + `Il reste ${fr1(pct)} % de la fourchette — le prix ${cote === "BAS" ? "baisse" : "monte"}`;
+    };
+    await checkNearSide(poolName, tick, tickLower, "BORNE BASSE", pctToLower, tick - tickLower, "Le prix baisse — surveille ta position !", key + "_near_lower", texte("bas"));
+    await checkNearSide(poolName, tick, tickUpper, "BORNE HAUTE", pctToUpper, tickUpper - tick, "Le prix monte — surveille ta position !", key + "_near_upper", texte("haut"));
 }
 
 // ── Vérification LP positions ─────────────────────────────────
 
-async function checkLpPosition(poolName, tick, tickLower, tickUpper, key, rpc) {
+async function checkLpPosition(poolName, tick, tickLower, tickUpper, key, rpc, px) {
     if (tick === null) {
         console.log("⚠️ " + poolName + " | Impossible de lire le tick (RPC KO)");
         return;
@@ -709,12 +784,25 @@ async function checkLpPosition(poolName, tick, tickLower, tickUpper, key, rpc) {
     console.log(poolName + " | Tick: " + tick + " | Range: [" + tickLower + ", " + tickUpper + "] | " + (inRange ? `IN RANGE (${pctInRange}%)` : "⚠️ OUT OF RANGE"));
     const side = tick < tickLower ? "BAS" : "HAUT";
     const dist = tick < tickLower ? tickLower - tick : tick - tickUpper;
-    await checkOorAlert(
-        key, inRange,
-        `🚨 OUT OF RANGE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Range       : [${tickLower}, ${tickUpper}]\n↕️ Côté        : ${side} (${dist} ticks hors range)\n\nAjuste ou retire ta position !`,
-        `✅ Retour IN RANGE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Range       : [${tickLower}, ${tickUpper}]\n📊 Position    : ${pctInRange ?? '?'}% dans le range`
-    );
-    await checkNearRange(poolName, tick, tickLower, tickUpper, key);
+    let alerte = `🚨 OUT OF RANGE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Range       : [${tickLower}, ${tickUpper}]\n↕️ Côté        : ${side} (${dist} ticks hors range)\n\nAjuste ou retire ta position !`;
+    let retour = `✅ Retour IN RANGE — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Range       : [${tickLower}, ${tickUpper}]\n📊 Position    : ${pctInRange ?? '?'}% dans le range`;
+    if (px) {
+        const v = vueFourchette(px, tick, tickLower, tickUpper);
+        const coteTick = tick < tickLower ? "bas" : "haut";
+        const cote = (coteTick === "bas") !== v.inv ? "BAS" : "HAUT";
+        const borne = cote === "BAS" ? v.bas : v.haut;
+        const tout = coteTick === "bas" ? px.sym0 : px.sym1;   // sous la fourchette → 100 % jeton 0, au-dessus → 100 % jeton 1
+        alerte = `🚨 HORS FOURCHETTE par le ${cote} — ${poolName}\n\n`
+            + `Prix : ${fmtPrix(v.prix)} ${v.unite}\n`
+            + `Fourchette : ${fmtPrix(v.bas)} → ${fmtPrix(v.haut)}\n`
+            + `Le prix est ${fr1((v.prix / borne - 1) * 100)} % ${cote === "BAS" ? "sous le bas" : "au-dessus du haut"} : plus aucun frais, la position est 100 % en ${tout}.\n\n`
+            + `Ajuste ou retire ta position !`;
+        retour = `✅ De retour dans la fourchette — ${poolName}\n\n`
+            + `Prix : ${fmtPrix(v.prix)} ${v.unite}\n`
+            + `Fourchette : ${fmtPrix(v.bas)} → ${fmtPrix(v.haut)}`;
+    }
+    await checkOorAlert(key, inRange, alerte, retour);
+    await checkNearRange(poolName, tick, tickLower, tickUpper, key, px);
 }
 
 // ── Boucle principale ─────────────────────────────────────────
@@ -748,42 +836,53 @@ async function check() {
     console.log("Velodrome: " + velodromePositions.length + " positions actives");
     for (const pos of velodromePositions) {
         console.log("Velodrome WBTC/WETH #" + pos.tokenId + " | Tick: " + veloTick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (veloTick !== null ? (veloTick >= pos.tickLower && veloTick <= pos.tickUpper ? "IN RANGE" : "⚠️ OUT OF RANGE") : "❌ RPC KO"));
-        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Soneium)", veloTick, pos.tickLower, pos.tickUpper, "velodrome_" + pos.tokenId);
+        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Soneium)", veloTick, pos.tickLower, pos.tickUpper, "velodrome_" + pos.tokenId,
+            SONEIUM_RPC, await paireEvm(SONEIUM_RPC, pos.token0, pos.token1));
     }
 
     console.log("Velodrome Ink: " + inkPositions.length + " positions actives");
     for (const pos of inkPositions) {
         const tick = await getPoolTick(INK_RPC, pos.pool);
         console.log(pos.poolName + " #" + pos.tokenId + " (Ink" + (pos.stakee ? ", stakée" : "") + ") | Tick: " + tick + " | Range: [" + pos.tickLower + ", " + pos.tickUpper + "] | " + (tick !== null ? (tick >= pos.tickLower && tick <= pos.tickUpper ? "IN RANGE" : "⚠️ OUT OF RANGE") : "❌ RPC KO"));
-        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Ink)", tick, pos.tickLower, pos.tickUpper, "ink_" + pos.tokenId);
+        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Ink)", tick, pos.tickLower, pos.tickUpper, "ink_" + pos.tokenId,
+            INK_RPC, await paireEvm(INK_RPC, pos.token0, pos.token1));
     }
 
     console.log("Arc: " + arcPositions.length + " positions actives");
     for (const pos of arcPositions) {
-        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Arc)", arcTick, pos.tickLower, pos.tickUpper, "arc_" + pos.tokenId);
+        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Arc)", arcTick, pos.tickLower, pos.tickUpper, "arc_" + pos.tokenId,
+            ARC_RPC, await paireEvm(ARC_RPC, pos.token0, pos.token1));
     }
 
     console.log("Raydium: " + raydiumPositions.length + " positions actives");
     for (const pos of raydiumPositions) {
         const tick = await getRaydiumPoolTick(pos.poolId);
-        await checkLpPosition(pos.poolName + " " + pos.poolId.slice(0, 6) + "… (Solana)", tick, pos.tickLower, pos.tickUpper, "raydium_" + pos.tokenId);
+        const px = await paireRaydium(pos.poolId);   // nom de la paire (KOx/USDC) au lieu du début de l'adresse
+        const nom = px ? `Raydium ${px.sym0}/${px.sym1}` : pos.poolName + " " + pos.poolId.slice(0, 6) + "…";
+        await checkLpPosition(nom + " (Solana)", tick, pos.tickLower, pos.tickUpper, "raydium_" + pos.tokenId, null, px);
     }
 
     console.log("PRJX: " + prjxPositions.length + " positions actives");
     for (let i = 0; i < prjxPositions.length; i++) {
         const pos = prjxPositions[i];
-        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Hyperliquid)", prjxTicks[i], pos.tickLower, pos.tickUpper, "prjx_" + pos.tokenId);
+        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Hyperliquid)", prjxTicks[i], pos.tickLower, pos.tickUpper, "prjx_" + pos.tokenId,
+            HYPERVM_RPC, await paireEvm(HYPERVM_RPC, pos.token0, pos.token1));
     }
 
     console.log("Satsuma: " + satsumaPositions.length + " positions actives");
     for (let i = 0; i < satsumaPositions.length; i++) {
         const pos = satsumaPositions[i];
-        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Citrea)", satsumaTicks[i], pos.tickLower, pos.tickUpper, "satsuma_" + pos.tokenId);
+        await checkLpPosition(pos.poolName + " #" + pos.tokenId + " (Citrea)", satsumaTicks[i], pos.tickLower, pos.tickUpper, "satsuma_" + pos.tokenId,
+            CITREA_RPC, await paireEvm(CITREA_RPC, pos.token0, pos.token1));
     }
 
     // Étape 4 : lending en parallèle
     // Étape 4 : lending + perps en parallèle
     await Promise.all([checkSakeLending(), checkMorphoLending(), checkListaLending(), checkHyperliquidPerps()]);
+    sauverEtatAlertes();
+    // (2026-10-15) analyse de rentabilité des LP : reçoit les listes déjà lues, ne bloque jamais ce cycle
+    try { analyseLp.tick({ hyperevm: prjxPositions, ink: inkPositions, soneium: velodromePositions }); }
+    catch (e) { console.log("analyse LP :", e.message); }
 }
 
 let isChecking = false;
@@ -793,6 +892,20 @@ async function safeCheck() {
     try { await check(); } finally { isChecking = false; }
 }
 console.log("🤖 EVM Bot démarré");
+// (2026-10-15, demande user) Analyse de rentabilité des positions LP — lecture seule, synthèse Telegram 1×/jour.
+// Détail et méthode dans analyse-lp.js ; état sur le volume (DATA_DIR/analyse-lp.json), page /analyse.
+const analyseLp = require("./analyse-lp");
+analyseLp.init({
+    dataDir: DATA_DIR, wallet: WALLET, sendAlert,
+    chaines: {
+        hyperevm: { nom: "Hyperliquid", protocole: "PRJX", rpc: HYPERVM_RPC, nfpm: PRJX_NFPM, natif: "HYPE",
+            dexscreener: "hyperevm", gecko: "hyperevm", etherscanChainId: 999, pauseMs: 1200 },
+        ink:      { nom: "Ink", protocole: "Velodrome", rpc: INK_RPC, nfpm: VELODROME_NFPM, natif: "ETH",
+            dexscreener: "ink", gecko: "ink", blockscout: INK_EXPLORER_API },
+        soneium:  { nom: "Soneium", protocole: "Velodrome", rpc: SONEIUM_RPC, nfpm: VELODROME_NFPM, natif: "ETH",
+            dexscreener: "soneium", gecko: "soneium", blockscout: "https://soneium.blockscout.com/api" },
+    },
+});
 console.log("🗄️ Logs: " + (DATA_DIR !== __dirname ? "persistés " + LOG_RETENTION_DAYS + "j dans " + LOG_DIR : "ÉPHÉMÈRES ⚠️ (DATA_DIR non défini — monter un volume Railway, sinon tout est perdu au redéploiement)"));
 setInterval(flushLogsToDisk, 20 * 1000);
 setInterval(rotateLogs, 6 * 3600e3);
@@ -834,12 +947,23 @@ http.createServer((req, res) => {
         const tail = parseInt(new URL(req.url, "http://x").searchParams.get("tail") || "300", 10);
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
         res.end(LOG_BUFFER.slice(-tail).join("\n"));
+    } else if (url === "/analyse") {
+        // bilan des stratégies LP (positions ouvertes et fermées) ; ?texte=1 → la synthèse telle qu'envoyée sur Telegram
+        const q = new URL(req.url, "http://x").searchParams;
+        const e = analyseLp.etat();
+        if (q.get("texte")) {
+            res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end(e.synthese || "Aucune position analysée pour l'instant (première mesure ~1 min après le démarrage).");
+        } else {
+            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify(e, null, 2));
+        }
     } else if (url === "/status") {
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(lastStatus, null, 2));
     } else {
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-        res.end("EVM alert bot OK\nEndpoints: /status  /logs?tail=N  /logs/list  /logs/file?date=YYYY-MM-DD");
+        res.end("EVM alert bot OK\nEndpoints: /status  /analyse  /analyse?texte=1  /logs?tail=N  /logs/list  /logs/file?date=YYYY-MM-DD");
     }
 }).listen(PORT, () => console.log("🌐 HTTP server on port " + PORT));
 
