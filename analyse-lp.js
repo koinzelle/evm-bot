@@ -733,7 +733,10 @@ async function aprPool(ch, pool) {
 function bilanPosition(P) {
     const k = `${P.ch}:${P.id}`, live = !P.fermeeA ? calculs[k] : null;
     // historique utilisable seulement si chaque événement a ses prix (sinon : base = première vue, signalée)
-    const evOk = P.pret && P.ev.some(e => e.type === 'inc') && P.ev.every(e => e.p0 != null && e.p1 != null);
+    // Solana : l'historique n'est complet qu'une fois TOUTE la relecture du wallet faite (sinon un encaissement de
+    // frais plus récent que l'ouverture manque encore — vu le 16/10 : verdict ❌ affiché pendant la relecture)
+    const solEnCours = P.ch === 'solana' && !(E.sol && E.sol.aLire && E.sol.aLire.length === 0);
+    const evOk = !solEnCours && P.pret && P.ev.some(e => e.type === 'inc') && P.ev.every(e => e.p0 != null && e.p1 != null);
     if (!live && !(P.fermeeA && evOk)) return null;
     let d0 = 0, d1 = 0, w0 = 0, w1 = 0, c0 = 0, c1 = 0, cap = 0, ret = 0, gas = 0, ouv = null, p0e = null, p1e = null, fin = null;
     if (evOk) {
