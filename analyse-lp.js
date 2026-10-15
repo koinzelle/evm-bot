@@ -354,7 +354,10 @@ async function decouvrir(ch) {
             // gauge : un transfert du wallet vers un contrat qui n'est pas l'adresse zéro = stake
             const stake = txs.find(t => String(t.tokenID) === String(id) && (t.from || '').toLowerCase() === C.wallet
                 && (t.to || '').toLowerCase() !== ZERO_ADR);
-            if (stake) P.gauge = stake.to.toLowerCase();
+            // seulement si ce contrat est un vrai gauge (rewardToken() répond) : sur HyperEVM, les NFT partent vers
+            // l'automate de rééquilibrage du user, pas vers un gauge — vu le 16/10 (« Récompenses » affiché à tort)
+            if (stake) { try { await appel(ch, stake.to, '0xf7c618c1'); P.gauge = stake.to.toLowerCase(); } catch (_) {} }
+            P.gaugeVerifie = true;
             E.positions[k] = P; n++;
             await enrichir(P); P.pret = true;
             if (P.gauge && P.fermeeA) { await reclamationsSansJeton(P); }
@@ -605,6 +608,10 @@ async function travailFond() {
         }
         for (const P of Object.values(E.positions)) {
             if (!P.t0 || enPanne.has(P.ch) || P.ch === 'solana') continue;
+            if (P.gauge && !P.gaugeVerifie && P.source === 'explorateur') {   // positions découvertes avant ce contrôle
+                try { await appel(P.ch, P.gauge, '0xf7c618c1'); } catch (e) { if (e.revert) { delete P.gauge; delete P.reclame; } }
+                P.gaugeVerifie = true;
+            }
             try {
                 if (P.ev.some(e => e.p1 === undefined || e.p0 == null || e.p1 == null)) {     // prix manquants (réseau) : on réessaie
                     for (const e of P.ev) if (e.p0 == null || e.p1 == null) delete e.p1;
