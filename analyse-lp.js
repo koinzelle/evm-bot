@@ -31,6 +31,9 @@ const DECOUVERTE_MS     = 60 * 60 * 1000;   // relecture des NFT du wallet chez 
 // Historique COMPLET : la fenêtre de 60 jours du 15/10 cachait l'essentiel des pertes du user (Soneium depuis
 // 09/2025 : 500 $ → 330 $ ; UBTC/kHYPE : 1 000 $ → 330 $, dont tout avant le 19/08 manquait). Réglable par ANALYSE_JOURS.
 const DECOUVERTE_JOURS  = Number(process.env.ANALYSE_JOURS || 400);
+// Solana à part : le wallet a ~12 000 transactions d'avril à août 2026 (activité de bot, pas de Raydium connu) et
+// 31 depuis septembre ; les relire toutes = 4 h de nœud public. 60 jours couvrent le Raydium du user (dès 20/09).
+const SOLANA_JOURS      = Number(process.env.ANALYSE_SOLANA_JOURS || 60);
 const DECOUVERTE_LOT    = 8;                // positions créées par passage : une chaîne lente ne bloque pas les autres
 const RAFRAICHIR_MS     = 30 * 60 * 1000;   // relecture des événements des positions ouvertes (explorateur)
 // Sans explorateur (HyperEVM sans clé), on lit les événements en RPC par fenêtres de 1 000 blocs (plafond
@@ -75,8 +78,9 @@ function charger() {
     try { E = JSON.parse(fs.readFileSync(fichier(), 'utf8')); } catch (_) { /* premier démarrage */ }
     for (const k of ['positions', 'tokens', 'pools', 'prochaineDecouverte', 'ignores']) E[k] = E[k] || {};
     if (E.fenetreJours !== DECOUVERTE_JOURS) {            // fenêtre élargie : on relit l'historique au-delà
-        E.fenetreJours = DECOUVERTE_JOURS; E.prochaineDecouverte = {}; E.sol = null;
+        E.fenetreJours = DECOUVERTE_JOURS; E.prochaineDecouverte = {};
     }
+    if (E.fenetreSolana !== SOLANA_JOURS) { E.fenetreSolana = SOLANA_JOURS; E.sol = null; }
 }
 function sauver() {
     try { const f = fichier(); fs.writeFileSync(f + '.tmp', JSON.stringify(E)); fs.renameSync(f + '.tmp', f); }
@@ -583,7 +587,7 @@ async function scanSolana() {
     if (!conf) return;
     const S = E.sol = E.sol || { plusRecente: null, aLire: null };
     if (!S.aLire) {
-        const limite = Date.now() / 1000 - DECOUVERTE_JOURS * 86400, liste = [];
+        const limite = Date.now() / 1000 - SOLANA_JOURS * 86400, liste = [];
         let avant = null;
         for (let page = 0; page < 10; page++) {
             const L = await rpc('solana', 'getSignaturesForAddress', [conf.wallet, avant ? { before: avant, limit: 1000 } : { limit: 1000 }]);
@@ -595,7 +599,7 @@ async function scanSolana() {
             avant = L[L.length - 1].signature;
         }
         S.aLire = liste.reverse();                            // de la plus ancienne à la plus récente
-        log(`solana : ${S.aLire.length} transaction(s) du wallet à relire (${DECOUVERTE_JOURS} jours)`);
+        log(`solana : ${S.aLire.length} transaction(s) du wallet à relire (${SOLANA_JOURS} jours)`);
     } else if (!S.aLire.length && S.plusRecente) {
         const L = await rpc('solana', 'getSignaturesForAddress', [conf.wallet, { until: S.plusRecente, limit: 1000 }]);
         if (L.length) { S.plusRecente = L[0].signature; S.aLire = L.filter(x => !x.err).map(x => x.signature).reverse(); }
