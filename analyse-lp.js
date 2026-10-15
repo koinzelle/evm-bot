@@ -116,8 +116,12 @@ function explorateur(ch) {
         return { url: 'https://api.etherscan.io/v2/api', extra: { chainid: conf.etherscanChainId, apikey: process.env.ETHERSCAN_API_KEY } };
     return null;
 }
+// après un refus (429), on laisse l'explorateur en paix 10 min : relancer chaque minute entretenait le blocage
+// (Blockscout Soneium a refusé TOUS les appels pendant 10 min le 16/10)
+const _pauseExpl = {};
 function explGet(ch, params) {
     const X = explorateur(ch);
+    if (Date.now() < (_pauseExpl[X.url] || 0)) return Promise.reject(new Error('explorateur en pause après un 429'));
     // Etherscan gratuit = 5 appels/s ; Blockscout public est plus strict (429 en rafale vu le 15/10 sur Soneium)
     return enFile('expl:' + X.url, C.chaines[ch].explPauseMs || (C.chaines[ch].blockscout ? 1500 : 350), async () => {
         for (let essai = 0; essai < 3; essai++) {
@@ -128,7 +132,10 @@ function explGet(ch, params) {
                 if (/no (records|transactions|logs) found/i.test(String(r.data?.message || '') + String(res || ''))) return [];
                 if (/rate limit|max rate/i.test(String(res || ''))) { await attendre(2000 * (essai + 1)); continue; }
                 throw new Error('explorateur : ' + String(res || r.data?.message || 'réponse inattendue').slice(0, 80));
-            } catch (e) { if (essai === 2) throw e; await attendre(5000 * 2 ** essai); }   // 429 : 5 s, 10 s
+            } catch (e) {
+                if (essai === 2) { if (/429/.test(e.message)) _pauseExpl[X.url] = Date.now() + 10 * 60e3; throw e; }
+                await attendre(5000 * 2 ** essai);               // 429 : 5 s, 10 s
+            }
         }
         return [];
     });
@@ -365,6 +372,7 @@ async function decouvrir(ch) {
             P.gaugeVerifie = true;
             E.positions[k] = P; n++;
             await enrichir(P); P.pret = true;
+            P.rafraichiA = Date.now(); if (P.fermeeA) P.fermetureLue = true;   // historique complet déjà lu : pas de relecture
             if (P.gauge && P.fermeeA) { await reclamationsSansJeton(P); }
             sauver();
         } catch (e) {
