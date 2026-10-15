@@ -112,7 +112,7 @@ function explorateur(ch) {
 function explGet(ch, params) {
     const X = explorateur(ch);
     // Etherscan gratuit = 5 appels/s ; Blockscout public est plus strict (429 en rafale vu le 15/10 sur Soneium)
-    return enFile('expl:' + X.url, C.chaines[ch].blockscout ? 1500 : 350, async () => {
+    return enFile('expl:' + X.url, C.chaines[ch].explPauseMs || (C.chaines[ch].blockscout ? 1500 : 350), async () => {
         for (let essai = 0; essai < 3; essai++) {
             try {
                 const r = await axios.get(X.url, { timeout: 20000, params: { ...X.extra, ...params } });
@@ -405,9 +405,9 @@ async function travailFond() {
     if (!C || fondEnCours) return;
     fondEnCours = true;
     try {
-        const rpcFait = new Set();
+        const rpcFait = new Set(), enPanne = new Set();   // chaîne dont l'explorateur refuse : on la saute jusqu'au passage suivant
         for (const P of Object.values(E.positions)) {
-            if (!P.t0) continue;
+            if (!P.t0 || enPanne.has(P.ch)) continue;
             try {
                 if (P.ev.some(e => e.p1 === undefined || e.p0 == null || e.p1 == null)) {     // prix manquants (réseau) : on réessaie
                     for (const e of P.ev) if (e.p0 == null || e.p1 == null) delete e.p1;
@@ -420,11 +420,14 @@ async function travailFond() {
                     rpcFait.add(P.ch);                       // une seule fenêtre RPC par chaîne et par minute
                     await scanRpc(P);
                 }
-            } catch (e) { log(`${P.ch}:${P.id} : historique pas encore disponible — ${e.message}`); }
+            } catch (e) {
+                log(`${P.ch}:${P.id} : historique pas encore disponible — ${e.message}`);
+                if (/429|explorateur|rate/i.test(e.message)) enPanne.add(P.ch);
+            }
         }
         // ensuite seulement, la découverte des positions passées (lente, par lots)
         for (const ch of Object.keys(C.chaines)) {
-            if (explorateur(ch) && Date.now() >= ((E.prochaineDecouverte || {})[ch] || 0)) {
+            if (explorateur(ch) && !enPanne.has(ch) && Date.now() >= ((E.prochaineDecouverte || {})[ch] || 0)) {
                 try { await decouvrir(ch); }
                 catch (e) { log(`${ch} : découverte impossible — ${e.message}`); (E.prochaineDecouverte = E.prochaineDecouverte || {})[ch] = Date.now() + 10 * 60e3; }
             }

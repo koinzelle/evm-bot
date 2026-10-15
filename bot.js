@@ -903,7 +903,7 @@ analyseLp.init({
         ink:      { nom: "Ink", protocole: "Velodrome", rpc: INK_RPC, nfpm: VELODROME_NFPM, natif: "ETH",
             dexscreener: "ink", gecko: "ink", blockscout: INK_EXPLORER_API },
         soneium:  { nom: "Soneium", protocole: "Velodrome", rpc: SONEIUM_RPC, nfpm: VELODROME_NFPM, natif: "ETH",
-            dexscreener: "soneium", gecko: "soneium", blockscout: "https://soneium.blockscout.com/api" },
+            dexscreener: "soneium", gecko: "soneium", blockscout: "https://soneium.blockscout.com/api", explPauseMs: 3000 },
     },
 });
 console.log("🗄️ Logs: " + (DATA_DIR !== __dirname ? "persistés " + LOG_RETENTION_DAYS + "j dans " + LOG_DIR : "ÉPHÉMÈRES ⚠️ (DATA_DIR non défini — monter un volume Railway, sinon tout est perdu au redéploiement)"));
