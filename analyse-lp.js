@@ -20,6 +20,7 @@
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const MESURE_MS         = 15 * 60 * 1000;
 const HEURE_SYNTHESE    = Number(process.env.SYNTHESE_LP_HEURE || 9);   // heure de Paris
@@ -48,7 +49,8 @@ const ZERO_ADR    = '0x' + '0'.repeat(40);
 // Prix de référence : Hyperliquid pour HYPE/ETH/BTC (gratuit, bougies historiques), 1 $ pour les stables ;
 // l'autre jeton de la paire est valorisé par le prix de la pool elle-même.
 const STABLES = new Set(['USDC', 'USDT', 'USDT0', 'USD₮0', 'USDE', 'USDC.E', 'CTUSD', 'USD1', 'LISUSD', 'DAI', 'USDS', 'FDUSD', 'USDH']);
-const ANCRES  = { WHYPE: 'HYPE', HYPE: 'HYPE', WETH: 'ETH', ETH: 'ETH', KBTC: 'BTC', UBTC: 'BTC', WBTC: 'BTC', CBBTC: 'BTC', CIRBTC: 'BTC', BTC: 'BTC' };
+const ANCRES  = { WHYPE: 'HYPE', HYPE: 'HYPE', WETH: 'ETH', ETH: 'ETH', KBTC: 'BTC', UBTC: 'BTC', WBTC: 'BTC', CBBTC: 'BTC', CIRBTC: 'BTC', BTC: 'BTC',
+    SOL: 'SOL', WSOL: 'SOL' };
 
 let C = null;                                              // config injectée par bot.js
 let E = { positions: {}, tokens: {}, pools: {}, derniereSynthese: null, decouverte: {} };   // état persistant
@@ -92,7 +94,7 @@ function rpc(ch, method, params) {
             catch (e) { if (essai === 3) throw e; await attendre(3000 * (essai + 1)); continue; }
             if (r.data && r.data.error) {
                 const m = String(r.data.error.message || '');
-                if (/rate.?limit/i.test(m)) { await attendre(15000 * (essai + 1)); continue; }
+                if (/rate.?limit|too many requests/i.test(m)) { await attendre(15000 * (essai + 1)); continue; }
                 const err = new Error(m); err.revert = true; throw err;      // revert / paramètre refusé
             }
             return r.data.result;
@@ -150,7 +152,7 @@ let _mids = { t: 0, v: null };
 async function prixAncres() {
     if (_mids.v && Date.now() - _mids.t < 5 * 60e3) return _mids.v;
     const r = await enFile('hl', 300, () => axios.post('https://api.hyperliquid.xyz/info', { type: 'allMids' }, { timeout: 10000 }));
-    _mids = { t: Date.now(), v: { HYPE: +r.data.HYPE, ETH: +r.data.ETH, BTC: +r.data.BTC } };
+    _mids = { t: Date.now(), v: { HYPE: +r.data.HYPE, ETH: +r.data.ETH, BTC: +r.data.BTC, SOL: +r.data.SOL } };
     return _mids.v;
 }
 // Hyperliquid ne garde que les 5 000 dernières bougies par intervalle : 1 min ≈ 3,5 jours, 15 min ≈ 52 jours,
@@ -400,14 +402,209 @@ async function scanRpc(P) {
     if (S.ouvertureTrouvee && (n || !P.pret)) { await enrichir(P); P.pret = !S.abandon; }
 }
 
+// ── RAYDIUM CLMM (Solana) — ajouté le 16/10 (demande user) ────────────────────────────────────
+// Pas de « collect » simulable comme sur EVM : les frais en attente se RECALCULENT à partir des compteurs de la
+// pool (croissance globale des frais) et des deux bornes de la fourchette (comptes « tick array »), comme le
+// fait l'interface Raydium. Validé le 16/10 sur KOx/USDC : bornes lues = −2040 et 0, frais 2,46 $, valeur 400 $.
+// Historique : chaque opération Raydium inscrit un événement dans sa transaction (« Program data », Anchor) —
+// ouverture (dépôt), ajout, retrait (capital ET frais séparés) ; formats vérifiés sur les 2 transactions de la
+// position (ouverture 20/09, encaissement des frais 07/10). On remonte les transactions du wallet sur 60 jours.
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function b58(buf) {
+    let n = BigInt('0x' + (Buffer.from(buf).toString('hex') || '0')), s = '';
+    while (n > 0n) { s = B58[Number(n % 58n)] + s; n /= 58n; }
+    for (const b of buf) { if (b) break; s = '1' + s; }
+    return s;
+}
+const u64 = (b, o) => b.readBigUInt64LE(o), u128 = (b, o) => b.readBigUInt64LE(o) + (b.readBigUInt64LE(o + 8) << 64n);
+const M128 = (1n << 128n) - 1n, sub128 = (a, b) => (a - b) & M128;   // compteurs Uniswap : arithmétique modulo 2^128
+const discEvt = n => crypto.createHash('sha256').update('event:' + n).digest().subarray(0, 8).toString('hex');
+const EVT_RAY = { [discEvt('CreatePersonalPositionEvent')]: 'create', [discEvt('IncreaseLiquidityEvent')]: 'inc',
+    [discEvt('DecreaseLiquidityEvent')]: 'dec', [discEvt('LiquidityCalculateEvent')]: 'calc' };
+
+async function compteSol(adresse) {
+    const r = await rpc('solana', 'getAccountInfo', [adresse, { encoding: 'base64' }]);
+    return r && r.value ? Buffer.from(r.value.data[0], 'base64') : null;
+}
+async function symbolesSolana(mints) {
+    const out = {};
+    try {
+        const r = await axios.get('https://api.dexscreener.com/tokens/v1/solana/' + mints.join(','), { timeout: 10000 });
+        for (const p of r.data || []) for (const t of [p.baseToken, p.quoteToken]) if (t && mints.includes(t.address) && !out[t.address]) out[t.address] = t.symbol;
+    } catch (_) {}
+    return out;
+}
+// PoolState : mints 73/105, décimales 233/234, tick_spacing 235, sqrt_price_x64 253, tick 269, croissance des frais 277/293
+async function poolRaydium(poolId) {
+    const q = await compteSol(poolId);
+    if (!q) throw new Error('pool Raydium illisible');
+    const k = 'solana:' + poolId;
+    if (!E.pools[k]) {
+        const m0 = b58(q.subarray(73, 105)), m1 = b58(q.subarray(105, 137));
+        const syms = await symbolesSolana([m0, m1]);
+        E.tokens['solana:' + m0] = { adr: m0, dec: q[233], sym: syms[m0] || m0.slice(0, 4) };
+        E.tokens['solana:' + m1] = { adr: m1, dec: q[234], sym: syms[m1] || m1.slice(0, 4) };
+        E.pools[k] = { t0: m0, t1: m1 };
+    }
+    return { ...E.pools[k], ts: q.readUInt16LE(235), sp: u128(q, 253), tick: q.readInt32LE(269), g0: u128(q, 277), g1: u128(q, 293) };
+}
+// TickArrayState (10 240 octets) : pool à 8, premier tick à 40, 60 TickState de 168 octets à partir de 44
+async function tickRaydium(poolId, ts, t) {
+    const span = 60 * ts, start = Math.floor(t / span) * span;
+    const sb = Buffer.alloc(4); sb.writeInt32LE(start);
+    const r = await rpc('solana', 'getProgramAccounts', [C.chaines.solana.programme, { encoding: 'base64',
+        filters: [{ dataSize: 10240 }, { memcmp: { offset: 8, bytes: poolId } }, { memcmp: { offset: 40, bytes: b58(sb) } }] }]);
+    if (!r || !r.length) return null;
+    const d = Buffer.from(r[0].account.data[0], 'base64'), o = 44 + ((t - start) / ts) * 168;
+    if (d.readInt32LE(o) !== t) return null;                  // garde-fou : la borne lue doit être la nôtre
+    return { out0: u128(d, o + 36), out1: u128(d, o + 52) };
+}
+// PersonalPositionState : bornes 73/77, liquidité 81, croissance lue 97/113, frais dus 129/137
+async function mesurerRaydium(entree) {
+    const ch = 'solana', k = `${ch}:${entree.mint}`;
+    const p = await compteSol(entree.compte);
+    if (!p) return null;
+    const L = u128(p, 81);
+    if (L === 0n) return null;
+    const tl = p.readInt32LE(73), tu = p.readInt32LE(77);
+    const pool = await poolRaydium(entree.poolId);
+    const t0 = E.tokens[ch + ':' + pool.t0], t1 = E.tokens[ch + ':' + pool.t1];
+    let P = E.positions[k];
+    if (!P) {
+        P = E.positions[k] = { ch, id: entree.mint, ev: [], source: 'liste', suivi: { dansMs: 0, totalMs: 0, dernier: null, dernierDans: null } };
+        log(`nouvelle position suivie : ${k.slice(0, 20)}… ${t0.sym}/${t1.sym}`);
+    }
+    Object.assign(P, { pool: entree.poolId, t0: pool.t0, t1: pool.t1, tl, tu, compte: entree.compte, absent: 0 });
+    P.premiereVue = P.premiereVue || Date.now(); delete P.fermeeA;
+    // frais en attente = dus + L × (croissance des frais dans la fourchette − dernière croissance lue) / 2^64
+    let f0 = 0, f1 = 0, fraisLus = false;
+    const lo = await tickRaydium(entree.poolId, pool.ts, tl), up = await tickRaydium(entree.poolId, pool.ts, tu);
+    if (lo && up) {
+        const b0 = pool.tick >= tl ? lo.out0 : sub128(pool.g0, lo.out0), b1 = pool.tick >= tl ? lo.out1 : sub128(pool.g1, lo.out1);
+        const h0 = pool.tick < tu ? up.out0 : sub128(pool.g0, up.out0), h1 = pool.tick < tu ? up.out1 : sub128(pool.g1, up.out1);
+        const i0 = sub128(sub128(pool.g0, b0), h0), i1 = sub128(sub128(pool.g1, b1), h1);
+        f0 = Number(u64(p, 129) + ((L * sub128(i0, u128(p, 97))) >> 64n)) / 10 ** t0.dec;
+        f1 = Number(u64(p, 137) + ((L * sub128(i1, u128(p, 113))) >> 64n)) / 10 ** t1.dec;
+        fraisLus = true;
+    }
+    const sp = Number(pool.sp) / 2 ** 64, dans = pool.tick >= tl && pool.tick < tu;
+    const [r0, r1] = montants(L, sp, tl, tu);
+    const a0 = r0 / 10 ** t0.dec, a1 = r1 / 10 ** t1.dec;
+    const prix0en1 = sp * sp * 10 ** (t0.dec - t1.dec);
+    const [p0, p1] = await prixPaire(ch, t0, t1, prix0en1, null, entree.poolId);
+    if (P.prixPremiereVue == null) { P.prixPremiereVue = prix0en1; P.premiereVueMontants = [a0, a1]; P.premiereVuePrix = [p0, p1]; }
+    const S = P.suivi, now = Date.now();
+    if (S.dernier && now - S.dernier < 45 * 60e3) { const dt = now - S.dernier; S.totalMs += dt; if (S.dernierDans) S.dansMs += dt; }
+    S.dernier = now; S.dernierDans = dans;
+    const pl = Math.pow(1.0001, tl) * 10 ** (t0.dec - t1.dec), pu = Math.pow(1.0001, tu) * 10 ** (t0.dec - t1.dec);
+    const m = { cle: k, stakee: false, dans, tick: pool.tick, posDansPct: dans ? 100 * (pool.tick - tl) / (tu - tl) : null,
+        fourchette: [pl, pu], prix: prix0en1, largeurPct: 100 * (pu - pl) / ((pu + pl) / 2),
+        montants: [a0, a1], prixUsd: [p0, p1], valeur: p0 != null && p1 != null ? a0 * p0 + a1 * p1 : null,
+        fraisNonCollectes: [f0, f1], fraisLus, recomp: null, dansPct: S.totalMs > 0 ? 100 * S.dansMs / S.totalMs : (dans ? 100 : 0),
+        suiviDepuis: P.premiereVue, mesureA: now };
+    calculs[k] = m;
+    return m;
+}
+// une transaction du wallet → événements Raydium appliqués aux positions (ouverture, ajout, retrait, fermeture)
+async function traiterTxSolana(sig, tx) {
+    const logs = tx.meta?.logMessages || [];
+    if (!logs.some(l => l.includes(C.chaines.solana.programme))) return 0;
+    const t = tx.blockTime, slot = tx.slot, wallet = C.chaines.solana.wallet;
+    const nftAvant = new Set((tx.meta.preTokenBalances || []).filter(b => b.owner === wallet && b.uiTokenAmount.decimals === 0 && b.uiTokenAmount.amount === '1').map(b => b.mint));
+    const nftApres = new Set((tx.meta.postTokenBalances || []).filter(b => b.owner === wallet && b.uiTokenAmount.decimals === 0 && b.uiTokenAmount.amount === '1').map(b => b.mint));
+    let sp = null, n = 0, gasFait = false;
+    const ajouter = async (P, e) => {
+        const t0 = E.tokens['solana:' + P.t0], t1 = E.tokens['solana:' + P.t1];
+        if (P.ev.some(x => x.tx === e.tx && x.li === e.li)) return;
+        e.a0 = Number(e.r0) / 10 ** t0.dec; e.a1 = Number(e.r1) / 10 ** t1.dec;
+        const prix0en1 = sp != null ? Math.pow(Number(sp) / 2 ** 64, 2) * 10 ** (t0.dec - t1.dec) : null;
+        if (prix0en1 != null && e.type !== 'col') e.prix0en1 = prix0en1;
+        [e.p0, e.p1] = await prixPaire('solana', t0, t1, prix0en1, t * 1000, P.pool);
+        if (!gasFait) {                                       // frais de transaction Solana, une fois par transaction
+            gasFait = true; e.gasCompte = true;
+            const ps = await prixAncreA('SOL', t * 1000);
+            e.gasUsd = ps ? tx.meta.fee / 1e9 * ps : 0;
+        }
+        P.ev.push(e); P.ev.sort((a, b) => a.blk - b.blk || a.li - b.li); n++;
+    };
+    let li = 0;
+    for (const l of logs) {
+        li++;
+        if (!l.startsWith('Program data: ')) continue;
+        const b = Buffer.from(l.slice(14), 'base64'), type = EVT_RAY[b.subarray(0, 8).toString('hex')];
+        if (!type) continue;
+        if (type === 'calc') { sp = u128(b, 24); continue; }  // prix de la pool au moment de l'opération
+        if (type === 'create') {
+            const poolId = b58(b.subarray(8, 40)), nft = [...nftApres].find(m => !nftAvant.has(m));
+            if (!nft) continue;
+            const pool = await poolRaydium(poolId), k = 'solana:' + nft;
+            const P = E.positions[k] = E.positions[k] || { ch: 'solana', id: nft, ev: [], source: 'historique', suivi: { dansMs: 0, totalMs: 0, dernier: null, dernierDans: null } };
+            Object.assign(P, { pool: poolId, t0: pool.t0, t1: pool.t1, tl: b.readInt32LE(104), tu: b.readInt32LE(108) });
+            P.premiereVue = P.premiereVue || Date.now(); P.pret = true;
+            await ajouter(P, { type: 'inc', blk: slot, tx: sig, li, t, liq: u128(b, 112).toString(), r0: u64(b, 128).toString(), r1: u64(b, 136).toString() });
+        } else {
+            const P = E.positions['solana:' + b58(b.subarray(8, 40))];
+            if (!P || !P.t0) continue;                        // position ouverte avant la fenêtre de 60 jours
+            const liq = u128(b, 40).toString(), x0 = u64(b, 56), x1 = u64(b, 64);
+            if (type === 'inc') await ajouter(P, { type: 'inc', blk: slot, tx: sig, li, t, liq, r0: x0.toString(), r1: x1.toString() });
+            else {                                            // retrait : capital (dec) + capital et frais versés (col), comme sur EVM
+                await ajouter(P, { type: 'dec', blk: slot, tx: sig, li, t, liq, r0: x0.toString(), r1: x1.toString() });
+                await ajouter(P, { type: 'col', blk: slot, tx: sig, li: li + 0.5, t, liq: null, r0: (x0 + u64(b, 72)).toString(), r1: (x1 + u64(b, 80)).toString() });
+            }
+        }
+    }
+    // fermeture : le NFT de position disparaît du wallet (brûlé)
+    if (logs.some(l => /Instruction: ClosePosition/.test(l)))
+        for (const m of nftAvant) if (!nftApres.has(m) && E.positions['solana:' + m]) { E.positions['solana:' + m].fermeeA = t * 1000; delete calculs['solana:' + m]; }
+    return n;
+}
+// remonte les transactions du wallet Solana dans l'ORDRE CHRONOLOGIQUE (Solana les renvoie de la plus récente à la
+// plus ancienne : lues dans cet ordre, une fermeture arriverait avant l'ouverture et le retrait serait perdu).
+// 1) une fois : liste des signatures des 60 derniers jours ; 2) lecture par lots de 40, de la plus ancienne ;
+// 3) ensuite, seulement les nouvelles signatures.
+async function scanSolana() {
+    const conf = C.chaines.solana;
+    if (!conf) return;
+    const S = E.sol = E.sol || { plusRecente: null, aLire: null };
+    if (!S.aLire) {
+        const limite = Date.now() / 1000 - DECOUVERTE_JOURS * 86400, liste = [];
+        let avant = null;
+        for (let page = 0; page < 10; page++) {
+            const L = await rpc('solana', 'getSignaturesForAddress', [conf.wallet, avant ? { before: avant, limit: 1000 } : { limit: 1000 }]);
+            if (!L.length) break;
+            if (!S.plusRecente) S.plusRecente = L[0].signature;
+            let fin = false;
+            for (const x of L) { if ((x.blockTime || 0) < limite) { fin = true; break; } if (!x.err) liste.push(x.signature); }
+            if (fin || L.length < 1000) break;
+            avant = L[L.length - 1].signature;
+        }
+        S.aLire = liste.reverse();                            // de la plus ancienne à la plus récente
+        log(`solana : ${S.aLire.length} transaction(s) du wallet à relire (${DECOUVERTE_JOURS} jours)`);
+    } else if (!S.aLire.length && S.plusRecente) {
+        const L = await rpc('solana', 'getSignaturesForAddress', [conf.wallet, { until: S.plusRecente, limit: 1000 }]);
+        if (L.length) { S.plusRecente = L[0].signature; S.aLire = L.filter(x => !x.err).map(x => x.signature).reverse(); }
+    }
+    let n = 0;
+    while (S.aLire.length && n < 40) {
+        const sig = S.aLire[0];
+        const tx = await rpc('solana', 'getTransaction', [sig, { maxSupportedTransactionVersion: 0, encoding: 'json' }]);
+        if (tx) await traiterTxSolana(sig, tx);
+        S.aLire.shift(); n++;
+    }
+    if (n && !S.aLire.length) log(`solana : historique du wallet à jour`);
+}
+
 // ── Travail de fond (toutes les minutes) ──────────────────────────────────────────────────────
 async function travailFond() {
     if (!C || fondEnCours) return;
     fondEnCours = true;
     try {
         const rpcFait = new Set(), enPanne = new Set();   // chaîne dont l'explorateur refuse : on la saute jusqu'au passage suivant
+        if (C.chaines.solana) {
+            try { await scanSolana(); } catch (e) { log('solana : historique pas encore disponible — ' + e.message); }
+        }
         for (const P of Object.values(E.positions)) {
-            if (!P.t0 || enPanne.has(P.ch)) continue;
+            if (!P.t0 || enPanne.has(P.ch) || P.ch === 'solana') continue;
             try {
                 if (P.ev.some(e => e.p1 === undefined || e.p0 == null || e.p1 == null)) {     // prix manquants (réseau) : on réessaie
                     for (const e of P.ev) if (e.p0 == null || e.p1 == null) delete e.p1;
@@ -656,6 +853,7 @@ function maintenantParis() {
     return { jour: `${p.year}-${p.month}-${p.day}`, heure: Number(p.hour) % 24, court: `${p.day}/${p.month}` };
 }
 const jourParis = ms => new Intl.DateTimeFormat('fr-FR', { timeZone: 'Europe/Paris', day: '2-digit', month: '2-digit' }).format(new Date(ms));
+const idCourt = id => String(id).length > 12 ? String(id).slice(0, 6) + '…' : String(id);   // NFT Solana = adresse de 44 caractères
 function blocStrategie(S, maxFermees = 3) {
     const mot = S.stakee ? 'Récompenses' : 'Frais';
     const L = [`🧩 ${S.protocole} ${S.paire} (${S.chaine}) — ${S.n} position${S.n > 1 ? 's' : ''} depuis le ${jourParis(S.debut)} (${duree(S.dureeH)})`];
@@ -666,12 +864,12 @@ function blocStrategie(S, maxFermees = 3) {
     if (c) {
         const ou = c.dans === false ? ' · ⚠️ HORS fourchette'
             : c.posDansPct != null ? ` · prix à ${fr(c.posDansPct, 0)} % de la fourchette${c.posDansPct < 15 ? ' (près du bas)' : c.posDansPct > 85 ? ' (près du haut)' : ''}` : '';
-        L.push(`📍 En cours #${c.id} : ${fr(c.valeur)} $ · depuis ${duree(c.ageH)} · dans la fourchette ${fr(c.dansPct, 0)} % du temps suivi${ou}`
+        L.push(`📍 En cours #${idCourt(c.id)} : ${fr(c.valeur)} $ · depuis ${duree(c.ageH)} · dans la fourchette ${fr(c.dansPct, 0)} % du temps suivi${ou}`
             + `${c.base !== 'chaîne' ? ' (historique en cours de lecture)' : ''}`);
     }
     const fermees = S.positions.filter(b => !b.ouverte).reverse();
     for (const b of fermees.slice(0, maxFermees))
-        L.push(`🏁 #${b.id} : ${jourParis(b.ouverture)} → ${jourParis(b.fermeture)} (${duree(b.ageH)}) · PnL ${signe(b.pnl)} $ · effet LP ${signe(b.effetLp)} $`);
+        L.push(`🏁 #${idCourt(b.id)} : ${jourParis(b.ouverture)} → ${jourParis(b.fermeture)} (${duree(b.ageH)}) · PnL ${signe(b.pnl)} $ · effet LP ${signe(b.effetLp)} $`);
     if (fermees.length > maxFermees) L.push(`   … et ${fermees.length - maxFermees} autre(s) position(s) fermée(s)`);
     L.push(`${S.verdict.icone} ${S.verdict.texte}`);
     return L.join('\n');
@@ -698,7 +896,7 @@ async function mesurer() {
     for (const [ch, L] of Object.entries(listes)) {
         if (!C.chaines[ch]) continue;
         for (const entree of L || []) {
-            try { const m = await mesurerPosition(ch, entree); if (m) vues.add(m.cle); }
+            try { const m = ch === 'solana' ? await mesurerRaydium(entree) : await mesurerPosition(ch, entree); if (m) vues.add(m.cle); }
             catch (e) { log(`${ch}:${entree.tokenId} : mesure impossible — ${e.message}`); }
         }
     }
@@ -708,8 +906,13 @@ async function mesurer() {
         P.absent = (P.absent || 0) + 1;
         if (P.absent < 2) continue;
         try {
-            const pos = decoderPosition(await appel(P.ch, C.chaines[P.ch].nfpm, '0x99fbab88' + pad(P.id)));
-            if (pos.liquidity !== 0n) continue;
+            if (P.ch === 'solana') {                                // compte de position fermé = position fermée
+                const c = await compteSol(P.compte);
+                if (c && u128(c, 81) !== 0n) continue;
+            } else {
+                const pos = decoderPosition(await appel(P.ch, C.chaines[P.ch].nfpm, '0x99fbab88' + pad(P.id)));
+                if (pos.liquidity !== 0n) continue;
+            }
         } catch (e) { if (!e.revert) continue; }                   // revert = NFT brûlé ; erreur réseau = on attend
         P.fermeeA = Date.now(); P.fermetureLue = false; delete calculs[k];
         if (!explorateur(P.ch)) try { P.blocFermeture = parseInt(await rpc(P.ch, 'eth_blockNumber', []), 16); } catch (_) {}

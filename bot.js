@@ -373,7 +373,7 @@ async function getRaydiumPositions() {
                 const d = Buffer.from(acc.account.data[0], "base64");
                 const liq = d.readBigUInt64LE(81) + (d.readBigUInt64LE(89) << 64n);
                 if (liq === 0n) continue;                                  // position vidée → on ne suit plus
-                out.push({ tokenId: mint.slice(0, 6), poolId: b58encode(d.subarray(41, 73)),
+                out.push({ tokenId: mint.slice(0, 6), mint, compte: acc.pubkey, poolId: b58encode(d.subarray(41, 73)),
                     tickLower: d.readInt32LE(73), tickUpper: d.readInt32LE(77), poolName: "Raydium CLMM" });
             }
         }
@@ -881,7 +881,7 @@ async function check() {
     await Promise.all([checkSakeLending(), checkMorphoLending(), checkListaLending(), checkHyperliquidPerps()]);
     sauverEtatAlertes();
     // (2026-10-15) analyse de rentabilité des LP : reçoit les listes déjà lues, ne bloque jamais ce cycle
-    try { analyseLp.tick({ hyperevm: prjxPositions, ink: inkPositions, soneium: velodromePositions }); }
+    try { analyseLp.tick({ hyperevm: prjxPositions, ink: inkPositions, soneium: velodromePositions, solana: raydiumPositions }); }
     catch (e) { console.log("analyse LP :", e.message); }
 }
 
@@ -904,6 +904,9 @@ analyseLp.init({
             dexscreener: "ink", gecko: "ink", blockscout: INK_EXPLORER_API },
         soneium:  { nom: "Soneium", protocole: "Velodrome", rpc: SONEIUM_RPC, nfpm: VELODROME_NFPM, natif: "ETH",
             dexscreener: "soneium", gecko: "soneium", blockscout: "https://soneium.blockscout.com/api", explPauseMs: 3000 },
+        // (16/10) Raydium CLMM : frais recalculés depuis la pool et les bornes, historique relu dans les transactions du wallet
+        solana:   { nom: "Solana", protocole: "Raydium", rpc: SOL_RPC, wallet: SOL_WALLET, programme: RAY_CLMM, natif: "SOL",
+            dexscreener: "solana", gecko: "solana", pauseMs: 600 },
     },
 });
 console.log("🗄️ Logs: " + (DATA_DIR !== __dirname ? "persistés " + LOG_RETENTION_DAYS + "j dans " + LOG_DIR : "ÉPHÉMÈRES ⚠️ (DATA_DIR non défini — monter un volume Railway, sinon tout est perdu au redéploiement)"));
