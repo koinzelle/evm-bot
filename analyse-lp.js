@@ -28,7 +28,9 @@ const AGE_VERDICT_H     = 24;     // pas de verdict avant 24 h : sur quelques he
 const DANS_MIN_PCT      = 70;     // sous 70 % du temps dans la fourchette → élargir
 const ECART_STRATEGIE_J = 7;      // plus de 7 jours sans position sur une pool → la suivante repart de zéro
 const DECOUVERTE_MS     = 60 * 60 * 1000;   // relecture des NFT du wallet chez l'explorateur
-const DECOUVERTE_JOURS  = 60;               // positions passées : 60 derniers jours (Soneium en compte des dizaines)
+// Historique COMPLET : la fenêtre de 60 jours du 15/10 cachait l'essentiel des pertes du user (Soneium depuis
+// 09/2025 : 500 $ → 330 $ ; UBTC/kHYPE : 1 000 $ → 330 $, dont tout avant le 19/08 manquait). Réglable par ANALYSE_JOURS.
+const DECOUVERTE_JOURS  = Number(process.env.ANALYSE_JOURS || 400);
 const DECOUVERTE_LOT    = 8;                // positions créées par passage : une chaîne lente ne bloque pas les autres
 const RAFRAICHIR_MS     = 30 * 60 * 1000;   // relecture des événements des positions ouvertes (explorateur)
 // Sans explorateur (HyperEVM sans clé), on lit les événements en RPC par fenêtres de 1 000 blocs (plafond
@@ -72,6 +74,9 @@ function fichier() { return path.join(C.dataDir, 'analyse-lp.json'); }
 function charger() {
     try { E = JSON.parse(fs.readFileSync(fichier(), 'utf8')); } catch (_) { /* premier démarrage */ }
     for (const k of ['positions', 'tokens', 'pools', 'prochaineDecouverte', 'ignores']) E[k] = E[k] || {};
+    if (E.fenetreJours !== DECOUVERTE_JOURS) {            // fenêtre élargie : on relit l'historique au-delà
+        E.fenetreJours = DECOUVERTE_JOURS; E.prochaineDecouverte = {}; E.sol = null;
+    }
 }
 function sauver() {
     try { const f = fichier(); fs.writeFileSync(f + '.tmp', JSON.stringify(E)); fs.renameSync(f + '.tmp', f); }
@@ -745,17 +750,20 @@ function bilanPosition(P) {
     const solEnCours = P.ch === 'solana' && !(E.sol && E.sol.aLire && E.sol.aLire.length === 0);
     const evOk = !solEnCours && P.pret && P.ev.some(e => e.type === 'inc') && P.ev.every(e => e.p0 != null && e.p1 != null);
     if (!live && !(P.fermeeA && evOk)) return null;
-    let d0 = 0, d1 = 0, w0 = 0, w1 = 0, c0 = 0, c1 = 0, cap = 0, ret = 0, gas = 0, ouv = null, p0e = null, p1e = null, fin = null;
+    let d0 = 0, d1 = 0, w0 = 0, w1 = 0, c0 = 0, c1 = 0, cap = 0, ret = 0, gas = 0, ouv = null, p0e = null, p1e = null, fin = null, capInit = null;
     if (evOk) {
         for (const e of P.ev) {
             gas += e.gasUsd || 0;
-            if (e.type === 'inc') { d0 += e.a0; d1 += e.a1; cap += e.a0 * (e.p0 || 0) + e.a1 * (e.p1 || 0); if (ouv == null) { ouv = e.t * 1000; p0e = e.p0; p1e = e.p1; } }
+            if (e.type === 'inc') {
+                d0 += e.a0; d1 += e.a1; cap += e.a0 * (e.p0 || 0) + e.a1 * (e.p1 || 0);
+                if (ouv == null) { ouv = e.t * 1000; p0e = e.p0; p1e = e.p1; capInit = e.a0 * (e.p0 || 0) + e.a1 * (e.p1 || 0); }
+            }
             if (e.type === 'dec') { w0 += e.a0; w1 += e.a1; ret += e.a0 * (e.p0 || 0) + e.a1 * (e.p1 || 0); fin = e; }
             if (e.type === 'col') { c0 += e.a0; c1 += e.a1; }
         }
     } else {                                                  // historique pas encore lu : base = première vue
         [d0, d1] = P.premiereVueMontants; [p0e, p1e] = P.premiereVuePrix;
-        cap = d0 * (p0e || 0) + d1 * (p1e || 0); ouv = P.premiereVue;
+        cap = d0 * (p0e || 0) + d1 * (p1e || 0); ouv = P.premiereVue; capInit = cap;
     }
     const fc0 = Math.max(0, c0 - w0), fc1 = Math.max(0, c1 - w1);             // Collect = frais + capital retiré
     const t0 = E.tokens[P.ch + ':' + P.t0], t1 = E.tokens[P.ch + ':' + P.t1];
@@ -787,6 +795,15 @@ function bilanPosition(P) {
     b.effetLp = b.divergence + b.gains;                        // = vs HOLD
     b.effetMarche = deposeFin - cap;                           // ce qu'aurait fait le HOLD
     b.pnl = valeur + ret + b.gains - cap - gas;
+    // trésorerie : ce qui a été mis au départ, ce qui est revenu au wallet (capital retiré + gains, moins les frais
+    // réinvestis dans la position, déjà comptés dans le capital retiré), ce que vaut encore la position ouverte
+    b.capInit = capInit; b.rendu = ret;
+    const reinvesti = Math.max(0, cap - capInit);
+    if (live) {
+        const attente = live.fraisNonCollectes[0] * p0 + live.fraisNonCollectes[1] * p1
+            + (live.recomp ? live.recomp.enAttente * (P.prixRecomp || 0) : 0);
+        b.valeurFinale = valeur + attente;
+    } else b.sortie = ret + b.gains - reinvesti;
     b.roiPct = cap > 0 ? 100 * b.pnl / cap : null;
     b.aprPct = cap > 0 && b.ageH > 0.5 ? 100 * b.gains / cap * 8760 / b.ageH : null;
     return b;
@@ -833,6 +850,19 @@ function agreger(cle, B) {
     const [p0e, p1e] = prem.prixEntree, [p0f, p1f] = (S.enCours || der).prixFin;
     S.vs100_0 = p0e && p0f ? S.pnl - (S.capital / p0e * p0f - S.capital) : null;
     S.vs100_1 = p1e && p1f ? S.pnl - (S.capital / p1e * p1f - S.capital) : null;
+    // TRÉSORERIE : « j'ai mis X au départ, il me reste Y ». Additionner les PnL des positions ne le dit pas : entre
+    // deux positions il y a les swaps pour changer de fourchette, le glissement, l'argent retiré ou ajouté. Écart
+    // = capital de la position suivante − ce que la précédente a rendu (positif : ajouté ; négatif : retiré ou perdu).
+    S.depart = prem.capInit; S.ecarts = [];
+    for (let i = 1; i < B.length; i++) {
+        const a = B[i - 1], b = B[i];
+        const ecart = a.sortie != null && a.fermeture <= b.ouverture + 60e3 ? b.capInit - a.sortie : b.capInit;
+        if (Math.abs(ecart) >= 0.01) S.ecarts.push({ t: b.ouverture, usd: ecart });
+    }
+    S.sommeEcarts = S.ecarts.reduce((a, x) => a + x.usd, 0);
+    const ouvertes = B.filter(b => b.ouverte);
+    S.final = ouvertes.length ? ouvertes.reduce((a, b) => a + (b.valeurFinale || 0), 0) : (der.sortie || 0);
+    S.resultat = S.final - S.depart;
     S.verdict = verdictStrategie(S);
     return S;
 }
@@ -847,6 +877,9 @@ function verdictStrategie(S) {
             return { icone: '❌', texte: `Élargis la fourchette : ${S.n} positions en ${duree(S.dureeH)} (${duree(S.dureeMoyH)} en moyenne), et les ${mot} ne couvrent pas la divergence (${signe(S.effetLp)} $).` };
         return { icone: '❌', texte: `Change de paire ou de stratégie : sur ${S.n} position${S.n > 1 ? 's' : ''}, les ${mot} (${fr(S.gains)} $) ne couvrent pas la divergence (${fr(S.gains - S.effetLp)} $).` };
     }
+    // battre le HOLD ne suffit pas (remarque du user, 16/10) : si les jetons baissent, la LP perd moins, mais perd
+    if (S.pnl < 0)
+        return { icone: '⚠️', texte: `La LP fait mieux que garder les jetons (${signe(S.effetLp)} $), mais les positions perdent ${fr(-S.pnl)} $ : la baisse des jetons (${signe(S.effetMarche)} $) mange les ${mot}. C'est la paire qu'il faut changer, pas la fourchette.` };
     if (S.gains > 0 && S.gas > 0.3 * S.gains)
         return { icone: '⚠️', texte: `Le gas mange ${fr(100 * S.gas / S.gains, 0)} % des ${mot} : rouvre moins souvent ou élargis.` };
     if (cur && cur.dans === false)
@@ -867,7 +900,12 @@ const idCourt = id => String(id).length > 12 ? String(id).slice(0, 6) + '…' : 
 function blocStrategie(S, maxFermees = 3) {
     const mot = S.stakee ? 'Récompenses' : 'Frais';
     const L = [`🧩 ${S.protocole} ${S.paire} (${S.chaine}) — ${S.n} position${S.n > 1 ? 's' : ''} depuis le ${jourParis(S.debut)} (${duree(S.dureeH)})`];
-    L.push(`💰 PnL ${signe(S.pnl)} $ (${signe(S.roiPct, 1)} %) · ${mot} ${fr(S.gains)} $ · APR ${fr(S.aprPct, 0)} % · gas ${fr(S.gas)} $`);
+    L.push(`💵 Mis au départ ${fr(S.depart)} $ le ${jourParis(S.debut)} · ${S.enCours ? 'vaut' : 'rendu'} ${fr(S.final)} $ aujourd'hui (${signe(S.resultat)} $)`);
+    if (S.ecarts.length) {
+        const gros = S.ecarts.filter(x => Math.abs(x.usd) >= 10).sort((a, b) => Math.abs(b.usd) - Math.abs(a.usd)).slice(0, 3);
+        L.push(`   = positions ${signe(S.pnl)} $ + entre deux positions ${signe(S.sommeEcarts)} $ (retiré, ajouté ou perdu en swaps${gros.length ? ' : ' + gros.map(x => `${jourParis(x.t)} ${signe(x.usd, 0)} $`).join(', ') : ''})`);
+    }
+    L.push(`💰 PnL des positions ${signe(S.pnl)} $ (${signe(S.roiPct, 1)} %) · ${mot} ${fr(S.gains)} $ · APR ${fr(S.aprPct, 0)} % · gas ${fr(S.gas)} $`);
     L.push(`⚖️ Effet LP ${signe(S.effetLp)} $ (${mot.toLowerCase()} − divergence) · effet marché ${signe(S.effetMarche)} $`);
     if (S.vs100_0 != null && S.vs100_1 != null) L.push(`↔️ vs 100 % ${S.sym1} ${signe(S.vs100_1)} $ · vs 100 % ${S.sym0} ${signe(S.vs100_0)} $`);
     const c = S.enCours;
