@@ -27,6 +27,8 @@ const AGE_VERDICT_H     = 24;     // pas de verdict avant 24 h : sur quelques he
 const DANS_MIN_PCT      = 70;     // sous 70 % du temps dans la fourchette → élargir
 const ECART_STRATEGIE_J = 7;      // plus de 7 jours sans position sur une pool → la suivante repart de zéro
 const DECOUVERTE_MS     = 60 * 60 * 1000;   // relecture des NFT du wallet chez l'explorateur
+const DECOUVERTE_JOURS  = 60;               // positions passées : 60 derniers jours (Soneium en compte des dizaines)
+const DECOUVERTE_LOT    = 8;                // positions créées par passage : une chaîne lente ne bloque pas les autres
 const RAFRAICHIR_MS     = 30 * 60 * 1000;   // relecture des événements des positions ouvertes (explorateur)
 // Sans explorateur (HyperEVM sans clé), on lit les événements en RPC par fenêtres de 1 000 blocs (plafond
 // du nœud public, mesuré le 15/10), UNE fenêtre par minute : plus vite, le nœud renvoie « rate limited » à
@@ -67,7 +69,7 @@ const log   = m => console.log('  📐 ' + m);
 function fichier() { return path.join(C.dataDir, 'analyse-lp.json'); }
 function charger() {
     try { E = JSON.parse(fs.readFileSync(fichier(), 'utf8')); } catch (_) { /* premier démarrage */ }
-    for (const k of ['positions', 'tokens', 'pools', 'decouverte']) E[k] = E[k] || {};
+    for (const k of ['positions', 'tokens', 'pools', 'prochaineDecouverte', 'ignores']) E[k] = E[k] || {};
 }
 function sauver() {
     try { const f = fichier(); fs.writeFileSync(f + '.tmp', JSON.stringify(E)); fs.renameSync(f + '.tmp', f); }
@@ -109,7 +111,8 @@ function explorateur(ch) {
 }
 function explGet(ch, params) {
     const X = explorateur(ch);
-    return enFile('expl:' + X.url, 350, async () => {          // Etherscan gratuit = 5 appels/s
+    // Etherscan gratuit = 5 appels/s ; Blockscout public est plus strict (429 en rafale vu le 15/10 sur Soneium)
+    return enFile('expl:' + X.url, C.chaines[ch].blockscout ? 1500 : 350, async () => {
         for (let essai = 0; essai < 3; essai++) {
             try {
                 const r = await axios.get(X.url, { timeout: 20000, params: { ...X.extra, ...params } });
@@ -329,19 +332,23 @@ async function creerDepuisChaine(ch, id) {
     // stakée chez un gauge ? (positions Velodrome) — le dernier transfert du NFT part du wallet vers le gauge
     return P;
 }
+// par lots : au premier refus de l'explorateur on s'arrête et on reprend 10 min plus tard
 async function decouvrir(ch) {
     if (!explorateur(ch)) return;
+    E.prochaineDecouverte = E.prochaineDecouverte || {}; E.ignores = E.ignores || {};
     const txs = await explGet(ch, { module: 'account', action: 'tokennfttx', contractaddress: C.chaines[ch].nfpm,
         address: C.wallet, page: 1, offset: 1000, sort: 'asc' });
-    const ids = [...new Set(txs.filter(t => (t.from || '').toLowerCase() === ZERO_ADR && (t.to || '').toLowerCase() === C.wallet)
-        .map(t => String(t.tokenID)))];
-    let n = 0;
+    const depuis = Date.now() / 1000 - DECOUVERTE_JOURS * 86400;
+    const ids = [...new Set(txs.filter(t => (t.from || '').toLowerCase() === ZERO_ADR && (t.to || '').toLowerCase() === C.wallet
+        && Number(t.timeStamp) >= depuis).map(t => String(t.tokenID)))];
+    let n = 0, reste = 0;
     for (const id of ids) {
         const k = `${ch}:${id}`;
-        if (E.positions[k]) continue;
+        if (E.positions[k] || E.ignores[k]) continue;
+        if (n >= DECOUVERTE_LOT) { reste++; continue; }
         try {
             const P = await creerDepuisChaine(ch, id);
-            if (!P) continue;
+            if (!P) { E.ignores[k] = true; continue; }        // NFT sans dépôt ou sans Mint lisible : on ne réessaie pas
             // gauge : un transfert du wallet vers un contrat qui n'est pas l'adresse zéro = stake
             const stake = txs.find(t => String(t.tokenID) === String(id) && (t.from || '').toLowerCase() === C.wallet
                 && (t.to || '').toLowerCase() !== ZERO_ADR);
@@ -350,10 +357,14 @@ async function decouvrir(ch) {
             await enrichir(P); P.pret = true;
             if (P.gauge && P.fermeeA) { await reclamationsSansJeton(P); }
             sauver();
-        } catch (e) { log(`${k} : découverte impossible — ${e.message}`); }
+        } catch (e) {
+            log(`${ch} : découverte interrompue (${e.message}) — reprise dans 10 min`);
+            E.prochaineDecouverte[ch] = Date.now() + 10 * 60e3;
+            return;
+        }
     }
-    E.decouverte[ch] = Date.now();
-    if (n) log(`${ch} : ${n} position(s) passée(s) ajoutée(s) à l'historique`);
+    E.prochaineDecouverte[ch] = Date.now() + (reste ? 2 * 60e3 : DECOUVERTE_MS);
+    if (n) log(`${ch} : ${n} position(s) passée(s) ajoutée(s) à l'historique${reste ? ` (${reste} restante(s), suite dans 2 min)` : ''}`);
 }
 // relit les événements (explorateur) d'une position : collectes, réinvestissements, fermeture
 async function rafraichir(P) {
@@ -394,11 +405,6 @@ async function travailFond() {
     if (!C || fondEnCours) return;
     fondEnCours = true;
     try {
-        for (const ch of Object.keys(C.chaines)) {
-            if (explorateur(ch) && Date.now() - (E.decouverte[ch] || 0) > DECOUVERTE_MS) {
-                try { await decouvrir(ch); } catch (e) { log(`${ch} : découverte impossible — ${e.message}`); }
-            }
-        }
         const rpcFait = new Set();
         for (const P of Object.values(E.positions)) {
             if (!P.t0) continue;
@@ -415,6 +421,13 @@ async function travailFond() {
                     await scanRpc(P);
                 }
             } catch (e) { log(`${P.ch}:${P.id} : historique pas encore disponible — ${e.message}`); }
+        }
+        // ensuite seulement, la découverte des positions passées (lente, par lots)
+        for (const ch of Object.keys(C.chaines)) {
+            if (explorateur(ch) && Date.now() >= ((E.prochaineDecouverte || {})[ch] || 0)) {
+                try { await decouvrir(ch); }
+                catch (e) { log(`${ch} : découverte impossible — ${e.message}`); (E.prochaineDecouverte = E.prochaineDecouverte || {})[ch] = Date.now() + 10 * 60e3; }
+            }
         }
         sauver();
     } finally { fondEnCours = false; }
