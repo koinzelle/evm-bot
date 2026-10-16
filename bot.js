@@ -553,7 +553,7 @@ async function checkSakeLending() {
         if (totalDebt < 1) return;
         lastStatus.lending.push({ name: "Sake (Soneium)", hf: Number(hf.toFixed(4)), debt: Number(totalDebt.toFixed(2)) });
         await checkHfAlert("sake_hf", hf,
-            (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Sake Finance (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${totalDebt.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
+            (level, rappel) => `${rappel ? "⏰ " : "🚨 "}HF < ${level}${rappel ? " (rappel)" : ""} — LIQUIDATION RISK — Sake Finance (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${totalDebt.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
             `✅ Sake Finance — Risque écarté (Soneium)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${totalDebt.toFixed(2)}`);
     } catch (err) { console.log("Erreur Sake:", err.message); }
 }
@@ -580,7 +580,7 @@ async function checkMorphoLending() {
             console.log("Morpho " + label + " (" + chainName + ") | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2));
             lastStatus.lending.push({ name: "Morpho " + label + " (" + chainName + ")", hf: Number(hf.toFixed(4)), debt: Number(borUsd.toFixed(2)) });
             await checkHfAlert(key, hf,
-                (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Morpho Blue (${chainName})\n\n📊 Marché        : ${label}\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
+                (level, rappel) => `${rappel ? "⏰ " : "🚨 "}HF < ${level}${rappel ? " (rappel)" : ""} — LIQUIDATION RISK — Morpho Blue (${chainName})\n\n📊 Marché        : ${label}\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
                 `✅ Morpho ${label} — Risque écarté (${chainName})\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
         }
     } catch (err) { console.log("Erreur Morpho:", err.message); }
@@ -616,7 +616,7 @@ async function checkListaLending() {
         console.log("Lista Moolah slisBNB/lisUSD | HF: " + hf.toFixed(4) + " | Debt: $" + borUsd.toFixed(2) + " | Col: $" + colUsd.toFixed(2) + " (slisBNB $" + slisBnbUsd.toFixed(2) + ")");
         lastStatus.lending.push({ name: "Lista slisBNB/lisUSD (BSC)", hf: Number(hf.toFixed(4)), debt: Number(borUsd.toFixed(2)) });
         await checkHfAlert("lista_slisBNB_lisUSD", hf,
-            (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION RISK — Lista DAO Moolah (BSC)\n\n📊 Marché        : slisBNB/lisUSD\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
+            (level, rappel) => `${rappel ? "⏰ " : "🚨 "}HF < ${level}${rappel ? " (rappel)" : ""} — LIQUIDATION RISK — Lista DAO Moolah (BSC)\n\n📊 Marché        : slisBNB/lisUSD\n❤️ Health Factor : ${hf.toFixed(4)} (palier < ${level})\n💸 Dette         : $${borUsd.toFixed(2)}\n💎 Collatéral    : $${colUsd.toFixed(2)}\n⚡ Urgence       : ${hfUrgence(level)}\n\nRembourse ou ajoute du collatéral immédiatement !`,
             `✅ Lista Moolah slisBNB/lisUSD — Risque écarté (BSC)\n\n❤️ Health Factor : ${hf.toFixed(4)}\n💸 Dette         : $${borUsd.toFixed(2)}`);
     } catch (err) { console.log("Erreur Lista:", err.message); }
 }
@@ -665,7 +665,7 @@ async function checkHyperliquidPerps() {
                 taille: szi, mark: Number(mark.toPrecision(8)), liq: Number(liq.toPrecision(8)),
                 distLiqPct: Number(dist.toFixed(2)), pnl });
             await checkHfAlert("hlperp_" + q.coin, dist,
-                (level, rappel) => `${rappel ? "⏰ RAPPEL — " : ""}🚨 LIQUIDATION PROCHE — ${q.coin} ${sens} x${lev} (Hyperliquid)\n\n`
+                (level, rappel) => `${rappel ? "⏰ " : "🚨 "}PALIER < ${level} %${rappel ? " (rappel)" : ""} — LIQUIDATION PROCHE — ${q.coin} ${sens} x${lev} (Hyperliquid)\n\n`
                     + `📍 Prix mark      : ${mark.toPrecision(6)}\n`
                     + `💀 Liquidation    : ${liq.toPrecision(6)}\n`
                     + `📏 Distance       : ${dist.toFixed(1)}% (palier < ${level}%)\n`
@@ -735,14 +735,14 @@ async function checkNearSide(poolName, tick, bound, boundLabel, pctLeft, ticksLe
     const level = Math.min(...NEAR_LEVELS.filter(L => pctLeft <= L)); // palier le plus profond atteint
     if (!st || typeof st !== "object" || level < st.level) {
         // nouveau palier franchi → notif immédiate
-        const ok = await sendAlert(texte ? texte(false, pctLeft)
+        const ok = await sendAlert(texte ? texte(false, pctLeft, level)
             : `⚠️ PROCHE ${boundLabel} (palier ${level}%) — ${poolName}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
         if (ok) alertedPositions[key] = { level, lastAt: now };
     } else if (now - st.lastAt > NEAR_REMINDER_MS) {
         // toujours dans une zone d'alerte (n'importe quel palier 20/15/10/5) depuis > 1h → rappel horaire
         // avec l'état actuel. AVANT : ne rappelait qu'au palier 5% → une position collée à 8-12% restait
         // muette après la 1re alerte (bug : LP kHYPE/uBTC à 8.9% jamais rappelée).
-        const ok = await sendAlert(texte ? texte(true, pctLeft)
+        const ok = await sendAlert(texte ? texte(true, pctLeft, st.level)
             : `⏰ RAPPEL (palier ${st.level}%) — ${poolName} toujours proche ${boundLabel.toLowerCase()}\n\n📍 Tick actuel : ${tick}\n📏 Borne       : ${bound}\n📊 Reste       : ${pctLeft.toFixed(1)}% (${ticksLeft} ticks)\n\n${trendMsg}`);
         if (ok) st.lastAt = now;
     }
@@ -759,7 +759,8 @@ async function checkNearRange(poolName, tick, tickLower, tickUpper, key, px) {
         const v = vueFourchette(px, tick, tickLower, tickUpper);
         const cote = (coteTick === "bas") !== v.inv ? "BAS" : "HAUT";
         const borne = cote === "BAS" ? v.bas : v.haut;
-        return (rappel, pct) => `${rappel ? `⏰ RAPPEL — ${poolName} toujours proche du ${cote}` : `⚠️ Proche du ${cote} — ${poolName}`}\n\n`
+        // (16/10, demande user) palier EN TÊTE : lisible dans l'aperçu de la notification sans l'ouvrir
+        return (rappel, pct, palier) => `${rappel ? `⏰ PALIER ${palier} % (rappel) — toujours proche du ${cote} — ${poolName}` : `⚠️ PALIER ${palier} % — proche du ${cote} — ${poolName}`}\n\n`
             + `Prix : ${fmtPrix(v.prix)} ${v.unite}\n`
             + `${cote === "BAS" ? "Bas" : "Haut"} de la fourchette : ${fmtPrix(borne)} (${borne < v.prix ? "−" : "+"}${fr1((borne / v.prix - 1) * 100)} %)\n`
             + `Il reste ${fr1(pct)} % de la fourchette — le prix ${cote === "BAS" ? "baisse" : "monte"}`;
